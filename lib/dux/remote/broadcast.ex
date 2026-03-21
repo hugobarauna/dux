@@ -75,7 +75,7 @@ defmodule Dux.Remote.Broadcast do
     join_pipeline =
       left
       |> Dux.join(
-        Dux.from_query(~s(SELECT * FROM "#{broadcast_name}")),
+        Dux.from_query(~s(SELECT * FROM "#{escape_ident(broadcast_name)}")),
         on: on_spec,
         how: how
       )
@@ -151,4 +151,6 @@ defmodule Dux.Remote.Broadcast do
   defp normalize_on(col) when is_atom(col), do: [col]
   defp normalize_on(col) when is_binary(col), do: [String.to_atom(col)]
   defp normalize_on(cols) when is_list(cols), do: cols
+
+  defp escape_ident(name), do: String.replace(name, ~s("), ~s(""))
 end

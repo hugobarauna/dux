@@ -106,20 +106,11 @@ defmodule Dux.Remote.Merger do
         "SELECT * FROM (#{union_sql}) __merged"
 
       {:re_sort, sort_spec} ->
-        order =
-          Enum.map_join(sort_spec, ", ", fn
-            {:asc, col} -> ~s("#{col}" ASC)
-            {:desc, col} -> ~s("#{col}" DESC)
-          end)
-
+        order = format_order(sort_spec)
         "SELECT * FROM (#{union_sql}) __merged ORDER BY #{order}"
 
       {:re_sort_head, sort_spec, n} ->
-        order =
-          Enum.map_join(sort_spec, ", ", fn
-            {:asc, col} -> ~s("#{col}" ASC)
-            {:desc, col} -> ~s("#{col}" DESC)
-          end)
+        order = format_order(sort_spec)
 
         "SELECT * FROM (#{union_sql}) __merged ORDER BY #{order} LIMIT #{n}"
 
@@ -131,12 +122,12 @@ defmodule Dux.Remote.Merger do
 
       {:re_aggregate, groups, aggs} ->
         # Re-aggregate partial results
-        group_cols = Enum.map_join(groups, ", ", &~s("#{&1}"))
+        group_cols = Enum.map_join(groups, ", ", &qi/1)
 
         agg_cols =
           Enum.map_join(aggs, ", ", fn {name, _expr} ->
-            # Re-aggregate partial results: SUM of partial SUMs, etc.
-            "SUM(\"#{name}\") AS \"#{name}\""
+            quoted = qi(name)
+            "SUM(#{quoted}) AS #{quoted}"
           end)
 
         select = if groups == [], do: agg_cols, else: "#{group_cols}, #{agg_cols}"
@@ -180,4 +171,17 @@ defmodule Dux.Remote.Merger do
   defp find_groups([{:group_by, cols} | _]), do: cols
   defp find_groups([_ | rest]), do: find_groups(rest)
   defp find_groups([]), do: []
+
+  defp format_order(sort_spec) do
+    Enum.map_join(sort_spec, ", ", fn
+      {:asc, col} -> "#{qi(col)} ASC"
+      {:desc, col} -> "#{qi(col)} DESC"
+    end)
+  end
+
+  # Quote identifier — escape double quotes to prevent SQL injection
+  defp qi(name) do
+    escaped = String.replace(name, ~s("), ~s(""))
+    ~s("#{escaped}")
+  end
 end
