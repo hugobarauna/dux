@@ -244,4 +244,132 @@ defmodule Dux.DistributedTest do
       assert remote_workers_after == []
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Full distributed workflow: create → distribute → aggregate → collect
+  # ---------------------------------------------------------------------------
+
+  describe "full distributed workflow" do
+    test "create locally → fan out to workers → aggregate → collect result" do
+      {peer1, node1} = start_peer(:dist_workflow1)
+      {peer2, node2} = start_peer(:dist_workflow2)
+
+      try do
+        {:ok, w1} = start_worker_on(node1)
+        {:ok, w2} = start_worker_on(node2)
+
+        Process.sleep(200)
+
+        # Create a big-ish dataset locally
+        data =
+          for i <- 1..1000 do
+            %{
+              "id" => i,
+              "region" => Enum.at(["US", "EU", "APAC"], rem(i, 3)),
+              "amount" => i * 10
+            }
+          end
+
+        # Build the pipeline: filter → group → aggregate
+        pipeline =
+          Dux.from_list(data)
+          |> Dux.filter_with("amount > 500")
+          |> Dux.group_by(:region)
+          |> Dux.summarise_with(total: "SUM(amount)", n: "COUNT(*)")
+
+        # Distribute across 2 peer workers and collect
+        result =
+          Coordinator.execute(pipeline, workers: [w1, w2])
+          |> Dux.sort_by(:region)
+          |> Dux.collect()
+
+        # Verify the result makes sense
+        # Both workers process the same data (replicated source), so
+        # the merger re-aggregates: SUM of partial SUMs, SUM of partial COUNTs
+        assert length(result) == 3
+
+        regions = Enum.map(result, & &1["region"])
+        assert regions == ["APAC", "EU", "US"]
+
+        # Each region's count should be doubled (2 workers)
+        # Original: ~950 rows with amount > 500, split ~317 per region
+        # With 2 workers replicating: 2x
+        totals = Enum.map(result, & &1["total"])
+        assert Enum.all?(totals, &(&1 > 0))
+
+        # Verify locally for correctness
+        local_result =
+          Dux.from_list(data)
+          |> Dux.filter_with("amount > 500")
+          |> Dux.group_by(:region)
+          |> Dux.summarise_with(total: "SUM(amount)", n: "COUNT(*)")
+          |> Dux.sort_by(:region)
+          |> Dux.collect()
+
+        # Distributed totals should be 2x local (replicated source)
+        for {local, dist} <- Enum.zip(local_result, result) do
+          assert dist["total"] == local["total"] * 2
+          assert dist["n"] == local["n"] * 2
+          assert dist["region"] == local["region"]
+        end
+      after
+        stop_peer(peer1)
+        stop_peer(peer2)
+      end
+    end
+
+    test "broadcast join: dimension table on workers, fact table distributed" do
+      {peer1, node1} = start_peer(:dist_bcast_join1)
+      {peer2, node2} = start_peer(:dist_bcast_join2)
+
+      try do
+        {:ok, w1} = start_worker_on(node1)
+        {:ok, w2} = start_worker_on(node2)
+
+        Process.sleep(200)
+
+        # Create dimension table (small) and broadcast to all workers
+        db = Dux.Connection.get_db()
+
+        dim =
+          Dux.Native.df_query(db, """
+            SELECT 0 AS region_id, 'US' AS region_name
+            UNION ALL SELECT 1, 'EU'
+            UNION ALL SELECT 2, 'APAC'
+          """)
+
+        dim_ipc = Dux.Native.table_to_ipc(dim)
+
+        # Broadcast to both workers
+        {:ok, _} = Worker.register_table(w1, "regions", dim_ipc)
+        {:ok, _} = Worker.register_table(w2, "regions", dim_ipc)
+
+        # Execute a pipeline that joins against the broadcast table
+        pipeline =
+          Dux.from_query("""
+            SELECT x % 3 AS region_id, x * 10 AS amount
+            FROM range(1, 101) t(x)
+          """)
+          |> Dux.join(
+            Dux.from_query(~s(SELECT * FROM "regions")),
+            on: :region_id
+          )
+          |> Dux.group_by(:region_name)
+          |> Dux.summarise_with(total: "SUM(amount)")
+
+        result = Coordinator.execute(pipeline, workers: [w1, w2])
+        rows = Dux.sort_by(result, :region_name) |> Dux.collect()
+
+        assert length(rows) == 3
+
+        region_names = Enum.map(rows, & &1["region_name"])
+        assert "APAC" in region_names
+        assert "EU" in region_names
+        assert "US" in region_names
+      after
+        stop_peer(peer1)
+        stop_peer(peer2)
+      end
+    end
+  end
 end
