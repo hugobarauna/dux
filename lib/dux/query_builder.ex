@@ -206,16 +206,7 @@ defmodule Dux.QueryBuilder do
 
     join_type = join_type_sql(how)
 
-    join_clause =
-      case on_cols do
-        nil ->
-          "#{join_type} #{right_ref}"
-
-        cols ->
-          using = Enum.map_join(cols, ", ", &quote_ident/1)
-          "#{join_type} #{right_ref} USING (#{using})"
-      end
-
+    join_clause = build_join_clause(join_type, right_ref, on_cols, prev)
     {"SELECT * FROM #{prev} #{join_clause}", groups}
   end
 
@@ -243,6 +234,26 @@ defmodule Dux.QueryBuilder do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
+
+  defp build_join_clause(join_type, right_ref, nil, _prev) do
+    "#{join_type} #{right_ref}"
+  end
+
+  defp build_join_clause(join_type, right_ref, cols, prev) do
+    all_same? = Enum.all?(cols, fn {l, r} -> l == r end)
+
+    if all_same? do
+      using = Enum.map_join(cols, ", ", fn {l, _} -> quote_ident(l) end)
+      "#{join_type} #{right_ref} USING (#{using})"
+    else
+      on_cond =
+        Enum.map_join(cols, " AND ", fn {l, r} ->
+          "#{prev}.#{quote_ident(l)} = __right.#{quote_ident(r)}"
+        end)
+
+      "#{join_type} #{right_ref} ON #{on_cond}"
+    end
+  end
 
   defp row_to_select(row) do
     cols =

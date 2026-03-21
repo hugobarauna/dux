@@ -1,0 +1,467 @@
+defmodule Dux.Graph do
+  @moduledoc """
+  Graph analytics on Dux dataframes.
+
+  A graph is two Dux structs — vertices and edges. Every graph algorithm
+  reduces to joins, aggregations, and iterations on those tables. DuckDB
+  provides native acceleration via recursive CTEs for path algorithms.
+
+  ## Creating a graph
+
+      vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}])
+      edges = Dux.from_list([%{"src" => 1, "dst" => 2}, %{"src" => 2, "dst" => 3}])
+      graph = Dux.Graph.new(vertices: vertices, edges: edges)
+
+  ## Algorithms
+
+  All algorithms are compositions of Dux verbs — they return `%Dux{}` structs
+  that you can pipe into further operations.
+
+      graph
+      |> Dux.Graph.pagerank()
+      |> Dux.sort_by(desc: :rank)
+      |> Dux.head(10)
+      |> Dux.collect()
+  """
+
+  defstruct [:vertices, :edges, :vertex_id, :edge_src, :edge_dst]
+
+  @type t :: %__MODULE__{
+          vertices: Dux.t(),
+          edges: Dux.t(),
+          vertex_id: String.t(),
+          edge_src: String.t(),
+          edge_dst: String.t()
+        }
+
+  @doc """
+  Create a new graph from vertex and edge dataframes.
+
+  ## Options
+
+    * `:vertex_id` - column name for vertex IDs (default: `:id`)
+    * `:edge_src` - column name for edge source (default: `:src`)
+    * `:edge_dst` - column name for edge destination (default: `:dst`)
+
+  ## Examples
+
+      vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}])
+      edges = Dux.from_list([%{"src" => 1, "dst" => 2}, %{"src" => 2, "dst" => 3}])
+      graph = Dux.Graph.new(vertices: vertices, edges: edges)
+  """
+  def new(opts) do
+    %__MODULE__{
+      vertices: Keyword.fetch!(opts, :vertices),
+      edges: Keyword.fetch!(opts, :edges),
+      vertex_id: to_string(Keyword.get(opts, :vertex_id, :id)),
+      edge_src: to_string(Keyword.get(opts, :edge_src, :src)),
+      edge_dst: to_string(Keyword.get(opts, :edge_dst, :dst))
+    }
+  end
+
+  @doc """
+  Create a graph from an edge list. Vertices are inferred from unique
+  source and destination nodes.
+  """
+  def from_edgelist(%Dux{} = edges, opts \\ []) do
+    src_col = to_string(Keyword.get(opts, :edge_src, :src))
+    dst_col = to_string(Keyword.get(opts, :edge_dst, :dst))
+    id_col = to_string(Keyword.get(opts, :vertex_id, :id))
+
+    db = Dux.Connection.get_db()
+    {edges_sql, _} = Dux.QueryBuilder.build(edges, db)
+
+    vertices_sql = """
+      SELECT DISTINCT "#{id_col}" FROM (
+        SELECT "#{src_col}" AS "#{id_col}" FROM (#{edges_sql}) __e1
+        UNION
+        SELECT "#{dst_col}" AS "#{id_col}" FROM (#{edges_sql}) __e2
+      ) __combined
+    """
+
+    %__MODULE__{
+      vertices: Dux.from_query(vertices_sql),
+      edges: edges,
+      vertex_id: id_col,
+      edge_src: src_col,
+      edge_dst: dst_col
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Degree functions
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Compute the out-degree of each vertex.
+
+  Returns a `%Dux{}` with columns `[vertex_id, out_degree]`.
+
+  ## Examples
+
+      iex> edges = Dux.from_list([%{"src" => 1, "dst" => 2}, %{"src" => 1, "dst" => 3}, %{"src" => 2, "dst" => 3}])
+      iex> graph = Dux.Graph.new(vertices: Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}]), edges: edges)
+      iex> Dux.Graph.out_degree(graph) |> Dux.sort_by(:id) |> Dux.to_columns()
+      %{"id" => [1, 2], "out_degree" => [2, 1]}
+  """
+  def out_degree(%__MODULE__{} = graph) do
+    graph.edges
+    |> Dux.group_by(String.to_atom(graph.edge_src))
+    |> Dux.summarise_with(out_degree: "COUNT(*)")
+    |> Dux.rename([{String.to_atom(graph.edge_src), String.to_atom(graph.vertex_id)}])
+  end
+
+  @doc """
+  Compute the in-degree of each vertex.
+
+  Returns a `%Dux{}` with columns `[vertex_id, in_degree]`.
+
+  ## Examples
+
+      iex> edges = Dux.from_list([%{"src" => 1, "dst" => 2}, %{"src" => 1, "dst" => 3}, %{"src" => 2, "dst" => 3}])
+      iex> graph = Dux.Graph.new(vertices: Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}]), edges: edges)
+      iex> Dux.Graph.in_degree(graph) |> Dux.sort_by(:id) |> Dux.to_columns()
+      %{"id" => [2, 3], "in_degree" => [1, 2]}
+  """
+  def in_degree(%__MODULE__{} = graph) do
+    graph.edges
+    |> Dux.group_by(String.to_atom(graph.edge_dst))
+    |> Dux.summarise_with(in_degree: "COUNT(*)")
+    |> Dux.rename([{String.to_atom(graph.edge_dst), String.to_atom(graph.vertex_id)}])
+  end
+
+  @doc """
+  Compute the total degree (in + out) of each vertex.
+
+  Returns a `%Dux{}` with columns `[vertex_id, degree]`.
+  """
+  def degree(%__MODULE__{} = graph) do
+    vid = graph.vertex_id
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    db = Dux.Connection.get_db()
+    {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
+
+    sql = """
+      SELECT "#{vid}", CAST(COUNT(*) AS BIGINT) AS degree FROM (
+        SELECT "#{src}" AS "#{vid}" FROM (#{edges_sql}) __e1
+        UNION ALL
+        SELECT "#{dst}" AS "#{vid}" FROM (#{edges_sql}) __e2
+      ) __all_edges
+      GROUP BY "#{vid}"
+    """
+
+    Dux.from_query(sql)
+  end
+
+  # ---------------------------------------------------------------------------
+  # PageRank
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Compute PageRank scores for all vertices.
+
+  Returns a `%Dux{}` with columns `[vertex_id, rank]`.
+
+  ## Options
+
+    * `:damping` - damping factor (default: `0.85`)
+    * `:iterations` - number of iterations (default: `20`)
+
+  ## Examples
+
+      iex> edges = Dux.from_list([
+      ...>   %{"src" => 1, "dst" => 2},
+      ...>   %{"src" => 2, "dst" => 3},
+      ...>   %{"src" => 3, "dst" => 1},
+      ...>   %{"src" => 3, "dst" => 2}
+      ...> ])
+      iex> vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}])
+      iex> graph = Dux.Graph.new(vertices: vertices, edges: edges)
+      iex> result = Dux.Graph.pagerank(graph) |> Dux.sort_by(:id) |> Dux.collect()
+      iex> length(result) == 3
+      true
+      iex> Enum.all?(result, fn row -> row["rank"] > 0 end)
+      true
+  """
+  def pagerank(%__MODULE__{} = graph, opts \\ []) do
+    damping = Keyword.get(opts, :damping, 0.85)
+    iterations = Keyword.get(opts, :iterations, 20)
+
+    vid = graph.vertex_id
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    # Count vertices
+    n =
+      graph.vertices
+      |> Dux.summarise_with(n: "COUNT(*)")
+      |> Dux.collect()
+      |> hd()
+      |> Map.get("n")
+
+    # Compute out-degree and materialize
+    out_deg = out_degree(graph) |> Dux.compute()
+
+    # Initialize ranks: 1/n for every vertex
+    initial_rank = 1.0 / n
+
+    ranks =
+      graph.vertices
+      |> Dux.select([String.to_atom(vid)])
+      |> Dux.mutate_with(rank: "#{initial_rank}")
+      |> Dux.compute()
+
+    base_rank = (1.0 - damping) / n
+
+    # Iterative PageRank using SQL joins
+    # We keep all intermediate results alive to prevent GC of temp tables
+    {final, _history} =
+      Enum.reduce(1..iterations, {ranks, [ranks, out_deg]}, fn _i, {ranks, history} ->
+        db = Dux.Connection.get_db()
+
+        # Ensure temp tables exist for all referenced Dux structs
+        {:table, ranks_ref} = ranks.source
+        ranks_table = Dux.Native.table_ensure(db, ranks_ref)
+
+        {:table, outdeg_ref} = out_deg.source
+        outdeg_table = Dux.Native.table_ensure(db, outdeg_ref)
+
+        {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
+        {verts_sql, _} = Dux.QueryBuilder.build(graph.vertices, db)
+
+        sql = """
+          WITH
+            edges AS (#{edges_sql}),
+            verts AS (#{verts_sql}),
+            contributions AS (
+              SELECT
+                e."#{dst}" AS "#{vid}",
+                SUM(r."rank" / od."out_degree") AS incoming
+              FROM edges e
+              JOIN "#{ranks_table}" r ON e."#{src}" = r."#{vid}"
+              JOIN "#{outdeg_table}" od ON e."#{src}" = od."#{vid}"
+              GROUP BY e."#{dst}"
+            )
+          SELECT
+            v."#{vid}",
+            COALESCE(#{base_rank} + #{damping} * c.incoming, #{base_rank}) AS "rank"
+          FROM verts v
+          LEFT JOIN contributions c ON v."#{vid}" = c."#{vid}"
+        """
+
+        new_ranks = Dux.from_query(sql) |> Dux.compute()
+        {new_ranks, [new_ranks | history]}
+      end)
+
+    final
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shortest paths (via recursive CTE)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Find the shortest path distance from a source vertex to all reachable vertices.
+
+  Uses DuckDB's recursive CTEs for efficient graph traversal.
+  Returns a `%Dux{}` with columns `[node, dist]`.
+
+  ## Examples
+
+      iex> edges = Dux.from_list([
+      ...>   %{"src" => 1, "dst" => 2},
+      ...>   %{"src" => 2, "dst" => 3},
+      ...>   %{"src" => 1, "dst" => 3}
+      ...> ])
+      iex> vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}])
+      iex> graph = Dux.Graph.new(vertices: vertices, edges: edges)
+      iex> Dux.Graph.shortest_paths(graph, 1) |> Dux.sort_by(:node) |> Dux.to_columns()
+      %{"dist" => [0, 1, 1], "node" => [1, 2, 3]}
+  """
+  def shortest_paths(%__MODULE__{} = graph, from_vertex) do
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    db = Dux.Connection.get_db()
+    {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
+
+    # Use UNION (not UNION ALL) to deduplicate and prevent exponential blowup on cycles
+    sql = """
+    WITH RECURSIVE
+      edges_cte AS (#{edges_sql}),
+      paths AS (
+        SELECT #{from_vertex} AS node, 0 AS dist
+        UNION
+        SELECT e."#{dst}" AS node, p.dist + 1
+        FROM paths p
+        JOIN edges_cte e ON p.node = e."#{src}"
+        WHERE p.dist < 1000
+      )
+    SELECT node, MIN(dist) AS dist FROM paths GROUP BY node
+    """
+
+    Dux.from_query(sql)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Connected components
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Find connected components using iterative label propagation.
+
+  Each vertex is assigned a component ID (the minimum vertex ID in its component).
+  Returns a `%Dux{}` with columns `[vertex_id, component]`.
+
+  ## Examples
+
+      iex> edges = Dux.from_list([
+      ...>   %{"src" => 1, "dst" => 2},
+      ...>   %{"src" => 2, "dst" => 1},
+      ...>   %{"src" => 3, "dst" => 4},
+      ...>   %{"src" => 4, "dst" => 3}
+      ...> ])
+      iex> vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}, %{"id" => 4}])
+      iex> graph = Dux.Graph.new(vertices: vertices, edges: edges)
+      iex> result = Dux.Graph.connected_components(graph) |> Dux.sort_by(:id) |> Dux.to_columns()
+      iex> result["component"]
+      [1, 1, 3, 3]
+  """
+  def connected_components(%__MODULE__{} = graph, opts \\ []) do
+    max_iterations = Keyword.get(opts, :max_iterations, 100)
+    vid = graph.vertex_id
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    db = Dux.Connection.get_db()
+
+    # Initialize: each vertex's component = its own id
+    labels =
+      graph.vertices
+      |> Dux.select([String.to_atom(vid)])
+      |> Dux.mutate_with(component: ~s("#{vid}"))
+      |> Dux.compute()
+
+    # Iterate: propagate minimum label through neighbors (bidirectional)
+    # Keep history to prevent GC of temp tables
+    {final, _history} =
+      Enum.reduce_while(1..max_iterations, {labels, [labels]}, fn _i, {labels, history} ->
+        {:table, labels_ref} = labels.source
+        labels_table = Dux.Native.table_ensure(db, labels_ref)
+        {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
+
+        sql = """
+          WITH
+            edges AS (#{edges_sql}),
+            bidir_edges AS (
+              SELECT "#{src}" AS a, "#{dst}" AS b FROM edges
+              UNION
+              SELECT "#{dst}" AS a, "#{src}" AS b FROM edges
+            ),
+            neighbor_labels AS (
+              SELECT be.b AS "#{vid}", l.component
+              FROM bidir_edges be
+              JOIN "#{labels_table}" l ON be.a = l."#{vid}"
+            ),
+            all_labels AS (
+              SELECT "#{vid}", component FROM "#{labels_table}"
+              UNION ALL
+              SELECT "#{vid}", component FROM neighbor_labels
+            )
+          SELECT "#{vid}", MIN(component) AS component
+          FROM all_labels
+          GROUP BY "#{vid}"
+        """
+
+        new_labels = Dux.from_query(sql) |> Dux.compute()
+
+        # Check convergence
+        old_cols = Dux.to_columns(labels)
+        new_cols = Dux.to_columns(new_labels)
+
+        old_sorted = Enum.zip(old_cols[vid], old_cols["component"]) |> Enum.sort()
+        new_sorted = Enum.zip(new_cols[vid], new_cols["component"]) |> Enum.sort()
+
+        if old_sorted == new_sorted do
+          {:halt, {new_labels, [new_labels | history]}}
+        else
+          {:cont, {new_labels, [new_labels | history]}}
+        end
+      end)
+
+    final
+  end
+
+  # ---------------------------------------------------------------------------
+  # Triangle counting
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Count the number of triangles in the graph.
+
+  A triangle is a set of three vertices where each pair is connected by an edge.
+  Edges must be bidirectional for triangle detection.
+  Returns an integer count.
+
+  ## Examples
+
+      iex> edges = Dux.from_list([
+      ...>   %{"src" => 1, "dst" => 2}, %{"src" => 2, "dst" => 1},
+      ...>   %{"src" => 2, "dst" => 3}, %{"src" => 3, "dst" => 2},
+      ...>   %{"src" => 1, "dst" => 3}, %{"src" => 3, "dst" => 1}
+      ...> ])
+      iex> vertices = Dux.from_list([%{"id" => 1}, %{"id" => 2}, %{"id" => 3}])
+      iex> graph = Dux.Graph.new(vertices: vertices, edges: edges)
+      iex> Dux.Graph.triangle_count(graph)
+      1
+  """
+  def triangle_count(%__MODULE__{} = graph) do
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    db = Dux.Connection.get_db()
+    {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
+
+    sql = """
+    WITH edges_cte AS (#{edges_sql})
+    SELECT COUNT(*) AS cnt FROM (
+      SELECT DISTINCT
+        LEAST(e1."#{src}", e1."#{dst}", e2."#{dst}") AS a,
+        LEAST(
+          GREATEST(e1."#{src}", e1."#{dst}"),
+          GREATEST(e1."#{src}", e2."#{dst}"),
+          GREATEST(e1."#{dst}", e2."#{dst}")
+        ) AS b,
+        GREATEST(e1."#{src}", e1."#{dst}", e2."#{dst}") AS c
+      FROM edges_cte e1
+      JOIN edges_cte e2 ON e1."#{dst}" = e2."#{src}"
+      JOIN edges_cte e3 ON e2."#{dst}" = e3."#{src}" AND e3."#{dst}" = e1."#{src}"
+      WHERE e1."#{src}" < e1."#{dst}"
+        AND e1."#{dst}" < e2."#{dst}"
+    ) triangles
+    """
+
+    result = Dux.from_query(sql) |> Dux.collect()
+    hd(result)["cnt"]
+  end
+
+  # ---------------------------------------------------------------------------
+  # Counts
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Return the number of vertices.
+  """
+  def vertex_count(%__MODULE__{} = graph) do
+    Dux.n_rows(graph.vertices)
+  end
+
+  @doc """
+  Return the number of edges.
+  """
+  def edge_count(%__MODULE__{} = graph) do
+    Dux.n_rows(graph.edges)
+  end
+end

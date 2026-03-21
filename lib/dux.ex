@@ -562,9 +562,17 @@ defmodule Dux do
 
     on_cols =
       case on do
-        nil -> nil
-        col when is_atom(col) or is_binary(col) -> [to_col_name(col)]
-        cols when is_list(cols) -> Enum.map(cols, &to_col_name/1)
+        nil ->
+          nil
+
+        col when is_atom(col) or is_binary(col) ->
+          [{to_col_name(col), to_col_name(col)}]
+
+        cols when is_list(cols) ->
+          Enum.map(cols, fn
+            {left_col, right_col} -> {to_col_name(left_col), to_col_name(right_col)}
+            col -> {to_col_name(col), to_col_name(col)}
+          end)
       end
 
     %{left | ops: ops ++ [{:join, right, how, on_cols, suffix}]}
