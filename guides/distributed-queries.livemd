@@ -1,12 +1,7 @@
 # Distributed Queries
 
-## Setup
-
 ```elixir
 Mix.install([{:dux, "~> 0.1.0"}])
-```
-
-```elixir
 require Dux
 ```
 
