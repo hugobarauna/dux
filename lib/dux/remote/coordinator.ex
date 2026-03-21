@@ -19,7 +19,7 @@ defmodule Dux.Remote.Coordinator do
   The result is a `%Dux{}` struct with the merged data.
   """
 
-  alias Dux.Remote.{Merger, Partitioner, PipelineSplitter, Worker}
+  alias Dux.Remote.{Merger, Partitioner, PipelineSplitter, Shuffle, Worker}
   import Dux.SQL.Helpers, only: [qi: 1]
 
   # Broadcast threshold: 256MB serialized Arrow IPC
@@ -43,6 +43,7 @@ defmodule Dux.Remote.Coordinator do
     workers = Keyword.get_lazy(opts, :workers, &Worker.list/0)
     timeout = Keyword.get(opts, :timeout, :infinity)
     strategy = Keyword.get(opts, :strategy, :round_robin)
+    bcast_threshold = Keyword.get(opts, :broadcast_threshold, @broadcast_threshold)
 
     if workers == [] do
       raise ArgumentError, "no workers available for distributed execution"
@@ -53,36 +54,29 @@ defmodule Dux.Remote.Coordinator do
       PipelineSplitter.split(pipeline.ops)
 
     # Preprocess joins: broadcast/shuffle right sides that aren't worker-safe
-    {processed_ops, broadcast_tables} = preprocess_joins(worker_ops, workers, timeout)
+    case preprocess_joins(worker_ops, workers, timeout, bcast_threshold) do
+      {:ok, processed_ops, broadcast_tables} ->
+        # All joins handled inline (broadcast or push-down)
+        worker_pipeline = %{pipeline | ops: processed_ops}
 
-    worker_pipeline = %{pipeline | ops: processed_ops}
+        try do
+          result = execute_fan_out(worker_pipeline, workers, strategy, timeout)
+          result = apply_avg_rewrites(result, rewrites)
+          apply_coordinator_ops(result, coord_ops)
+        after
+          cleanup_broadcast_tables(workers, broadcast_tables)
+        end
 
-    try do
-      # Partition the worker pipeline across workers
-      assignments = Partitioner.assign(worker_pipeline, workers, strategy: strategy)
-
-      # Fan out: each worker executes its partition
-      results = fan_out(assignments, timeout)
-
-      # Collect successful results, handle failures
-      {successes, failures} = partition_results(results)
-
-      if successes == [] do
-        reasons = Enum.map(failures, fn {:error, reason} -> reason end)
-        raise ArgumentError, "all workers failed: #{inspect(reasons)}"
-      end
-
-      # Merge partial results on coordinator
-      merged = Merger.merge_to_dux(successes, worker_pipeline)
-
-      # Apply AVG rewrites if any
-      merged = apply_avg_rewrites(merged, rewrites)
-
-      # Apply coordinator-only ops (slice, pivot, etc.)
-      apply_coordinator_ops(merged, coord_ops)
-    after
-      # Clean up broadcast tables on all workers
-      cleanup_broadcast_tables(workers, broadcast_tables)
+      {:shuffle, ops_before, {right_computed, how, on_cols, suffix}, ops_after, broadcast_tables} ->
+        # Pipeline needs a shuffle stage: execute pre-join → shuffle → post-join
+        try do
+          execute_with_shuffle(
+            pipeline, ops_before, right_computed, how, on_cols, suffix,
+            ops_after, coord_ops, rewrites, workers, strategy, timeout
+          )
+        after
+          cleanup_broadcast_tables(workers, broadcast_tables)
+        end
     end
   end
 
@@ -102,6 +96,64 @@ defmodule Dux.Remote.Coordinator do
   # ---------------------------------------------------------------------------
   # Internal
   # ---------------------------------------------------------------------------
+
+  # Standard distributed execution: partition → fan out → merge
+  defp execute_fan_out(worker_pipeline, workers, strategy, timeout) do
+    assignments = Partitioner.assign(worker_pipeline, workers, strategy: strategy)
+    results = fan_out(assignments, timeout)
+    {successes, failures} = partition_results(results)
+
+    if successes == [] do
+      reasons = Enum.map(failures, fn {:error, reason} -> reason end)
+      raise ArgumentError, "all workers failed: #{inspect(reasons)}"
+    end
+
+    Merger.merge_to_dux(successes, worker_pipeline)
+  end
+
+  # Multi-stage execution for shuffle joins:
+  # 1. Execute ops before the join as a distributed query
+  # 2. Shuffle join the result with the right side
+  # 3. Apply remaining ops + coordinator ops
+  defp execute_with_shuffle(
+         pipeline, ops_before, right_computed, how, on_cols, _suffix,
+         ops_after, coord_ops, rewrites, workers, strategy, timeout
+       ) do
+    # Stage 1: execute pre-join ops distributed
+    left_result =
+      if ops_before == [] do
+        # No ops before join — just compute the source
+        Dux.compute(%{pipeline | ops: []})
+      else
+        pre_pipeline = %{pipeline | ops: ops_before}
+        execute_fan_out(pre_pipeline, workers, strategy, timeout)
+      end
+
+    # Stage 2: shuffle join
+    # Extract the join column for shuffle (uses first column pair)
+    {left_col, _right_col} = hd(on_cols)
+
+    shuffle_result =
+      Shuffle.execute(left_result, right_computed,
+        on: String.to_atom(left_col),
+        how: how,
+        workers: workers,
+        timeout: timeout
+      )
+
+    # Stage 3: apply remaining ops + rewrites + coordinator ops
+    # Any ops after the join in the worker list need to run on the shuffle result
+    result =
+      if ops_after == [] do
+        shuffle_result
+      else
+        post_pipeline = %{shuffle_result | ops: ops_after}
+        Dux.compute(post_pipeline)
+      end
+
+    result = apply_avg_rewrites(result, rewrites)
+    apply_coordinator_ops(result, coord_ops)
+  end
 
   defp fan_out(assignments, timeout) do
     # Execute in parallel via Task.async_stream
@@ -136,54 +188,67 @@ defmodule Dux.Remote.Coordinator do
   # ---------------------------------------------------------------------------
 
   # Scan worker ops for joins where the right side holds a source that
-  # workers can't resolve (e.g. a local {:table, ref}).  For each such join,
-  # compute the right side on the coordinator, broadcast it to all workers,
-  # and replace the join op with a join against the broadcast table.
+  # workers can't resolve (e.g. a local {:table, ref}).  For each such join:
   #
-  # Returns {processed_ops, broadcast_table_names} where broadcast_table_names
-  # is a list of names to clean up after query execution.
-  defp preprocess_joins(ops, workers, timeout) do
-    Enum.map_reduce(ops, [], fn
-      {:join, %Dux{} = right, how, on_cols, suffix}, broadcast_names ->
-        if worker_safe_source?(right.source) and Enum.all?(right.ops, &worker_safe_op?/1) do
-          # Right side is resolvable on workers — pass through unchanged
-          {{:join, right, how, on_cols, suffix}, broadcast_names}
-        else
-          # Right side has a local source — need to broadcast or shuffle
-          route_join(right, how, on_cols, suffix, workers, timeout, broadcast_names)
-        end
-
-      op, broadcast_names ->
-        {op, broadcast_names}
-    end)
+  # - Small right side → broadcast to workers, replace join with broadcast ref
+  # - Large right side → signal a pipeline split for shuffle join
+  #
+  # Returns:
+  #   {:ok, processed_ops, broadcast_names} — all joins handled inline
+  #   {:shuffle, ops_before, join_info, ops_after, broadcast_names} — need a shuffle stage
+  defp preprocess_joins(ops, workers, timeout, threshold) do
+    do_preprocess(ops, [], [], workers, timeout, threshold)
   end
 
-  # Route a join with a non-worker-safe right side to broadcast or shuffle.
-  defp route_join(right, how, on_cols, suffix, workers, timeout, broadcast_names) do
-    # Compute the right side on the coordinator
-    right_computed = Dux.compute(right)
-    {:table, right_ref} = right_computed.source
-    right_ipc = Dux.Native.table_to_ipc(right_ref)
+  # Base case: all ops processed, no shuffle needed
+  defp do_preprocess([], processed, broadcast_names, _workers, _timeout, _threshold) do
+    {:ok, Enum.reverse(processed), broadcast_names}
+  end
 
-    if byte_size(right_ipc) <= @broadcast_threshold do
-      # Small enough to broadcast
-      broadcast_name = "__bcast_#{:erlang.unique_integer([:positive])}"
-      broadcast_to_workers(workers, broadcast_name, right_ipc, timeout)
-
-      # Replace right side with a query against the broadcast table
-      broadcast_right = Dux.from_query("SELECT * FROM #{qi(broadcast_name)}")
-      {{:join, broadcast_right, how, on_cols, suffix}, [broadcast_name | broadcast_names]}
+  # Join op: check if right side is worker-safe
+  defp do_preprocess(
+         [{:join, %Dux{} = right, how, on_cols, suffix} = op | rest],
+         processed,
+         broadcast_names,
+         workers,
+         timeout,
+         threshold
+       ) do
+    if worker_safe_source?(right.source) and Enum.all?(right.ops, &worker_safe_op?/1) do
+      # Worker-safe — pass through
+      do_preprocess(rest, [op | processed], broadcast_names, workers, timeout, threshold)
     else
-      # Too large — fall back to shuffle.
-      # We can't inline this into the op list; the shuffle needs to execute
-      # as a separate coordinated stage. For now, raise with a clear message.
-      # Full shuffle-join integration is tracked as brief 2f (future work).
-      raise ArgumentError,
-            "right side of distributed join is too large to broadcast " <>
-              "(#{div(byte_size(right_ipc), 1024 * 1024)}MB > " <>
-              "#{div(@broadcast_threshold, 1024 * 1024)}MB threshold). " <>
-              "Use Dux.Remote.Shuffle.execute/3 directly for large-large joins."
+      # Non-worker-safe — compute right side and decide broadcast vs shuffle
+      right_computed = Dux.compute(right)
+      {:table, right_ref} = right_computed.source
+      right_ipc = Dux.Native.table_to_ipc(right_ref)
+
+      if byte_size(right_ipc) <= threshold do
+        # Small → broadcast
+        broadcast_name = "__bcast_#{:erlang.unique_integer([:positive])}"
+        broadcast_to_workers(workers, broadcast_name, right_ipc, timeout)
+        broadcast_right = Dux.from_query("SELECT * FROM #{qi(broadcast_name)}")
+        new_op = {:join, broadcast_right, how, on_cols, suffix}
+
+        do_preprocess(
+          rest,
+          [new_op | processed],
+          [broadcast_name | broadcast_names],
+          workers,
+          timeout,
+          threshold
+        )
+      else
+        # Large → shuffle. Split the pipeline here.
+        {:shuffle, Enum.reverse(processed),
+         {right_computed, how, on_cols, suffix}, rest, broadcast_names}
+      end
     end
+  end
+
+  # Non-join op: pass through
+  defp do_preprocess([op | rest], processed, broadcast_names, workers, timeout, threshold) do
+    do_preprocess(rest, [op | processed], broadcast_names, workers, timeout, threshold)
   end
 
   defp broadcast_to_workers(workers, name, ipc_binary, _timeout) do

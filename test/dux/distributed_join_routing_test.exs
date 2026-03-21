@@ -329,8 +329,9 @@ defmodule Dux.DistributedJoinRoutingTest do
         |> Dux.distribute(workers)
 
       # Self-join: the right side is the same pipeline but computed locally
-      right = Dux.from_list([%{id: 1, parent: 2}, %{id: 2, parent: 3}, %{id: 3, parent: nil}])
-              |> Dux.compute()
+      right =
+        Dux.from_list([%{id: 1, parent: 2}, %{id: 2, parent: 3}, %{id: 3, parent: nil}])
+        |> Dux.compute()
 
       result =
         df
@@ -341,6 +342,127 @@ defmodule Dux.DistributedJoinRoutingTest do
       # id=1 joins parent=2 → right id=2, id=2 joins parent=3 → right id=3
       ids = Enum.map(result, & &1["id"]) |> Enum.sort()
       assert ids == [1, 2]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shuffle join: distributed left + large local right
+  # ---------------------------------------------------------------------------
+
+  describe "shuffle join (forced via broadcast_threshold: 0)" do
+    test "large right side triggers shuffle join" do
+      workers = start_workers(2)
+
+      left_data = Enum.map(1..20, &%{id: &1, val: &1 * 10})
+      right_data = Enum.map(1..20, &%{id: &1, tag: "item_#{&1}"})
+
+      left = Dux.from_list(left_data)
+      right = Dux.from_list(right_data) |> Dux.compute()
+
+      # Force shuffle by setting broadcast threshold to 0
+      result =
+        left
+        |> Dux.join(right, on: :id)
+        |> Dux.Remote.Coordinator.execute(
+          workers: workers,
+          broadcast_threshold: 0
+        )
+        |> Dux.sort_by(:id)
+        |> Dux.to_rows()
+
+      # All 20 ids should match
+      ids = Enum.map(result, & &1["id"])
+      assert Enum.sort(ids) == Enum.to_list(1..20)
+      assert Enum.all?(result, &String.starts_with?(&1["tag"], "item_"))
+    end
+
+    test "shuffle join matches local join" do
+      workers = start_workers(2)
+
+      left_data = Enum.map(1..10, &%{key: &1, left_val: &1 * 10})
+      right_data = [%{key: 2, right_val: 200}, %{key: 5, right_val: 500}, %{key: 8, right_val: 800}]
+
+      left = Dux.from_list(left_data)
+      right = Dux.from_list(right_data) |> Dux.compute()
+
+      # Local join for comparison
+      local =
+        left
+        |> Dux.join(right, on: :key)
+        |> Dux.sort_by(:key)
+        |> Dux.to_rows()
+
+      # Shuffle join
+      shuffled =
+        left
+        |> Dux.join(right, on: :key)
+        |> Dux.Remote.Coordinator.execute(
+          workers: workers,
+          broadcast_threshold: 0
+        )
+        |> Dux.sort_by(:key)
+        |> Dux.to_rows()
+
+      # Same keys should match
+      local_keys = Enum.map(local, & &1["key"])
+      shuffle_keys = Enum.map(shuffled, & &1["key"])
+      assert local_keys == shuffle_keys
+
+      # Same right values
+      local_vals = Enum.map(local, & &1["right_val"])
+      shuffle_vals = Enum.map(shuffled, & &1["right_val"])
+      assert local_vals == shuffle_vals
+    end
+
+    test "left join via shuffle" do
+      workers = start_workers(2)
+
+      left = Dux.from_list([%{id: 1}, %{id: 2}, %{id: 3}])
+      right = Dux.from_list([%{id: 1, name: "Alice"}]) |> Dux.compute()
+
+      result =
+        left
+        |> Dux.join(right, on: :id, how: :left)
+        |> Dux.Remote.Coordinator.execute(
+          workers: workers,
+          broadcast_threshold: 0
+        )
+        |> Dux.sort_by(:id)
+        |> Dux.to_rows()
+
+      # All 3 left rows should be present
+      ids = Enum.map(result, & &1["id"]) |> Enum.sort()
+      assert ids == [1, 2, 3]
+
+      # Only id=1 should have a name
+      matched = Enum.filter(result, &(&1["name"] != nil))
+      assert length(matched) == 1
+      assert hd(matched)["name"] == "Alice"
+    end
+
+    test "shuffle with ops before the join" do
+      workers = start_workers(2)
+
+      left = Dux.from_list(Enum.map(1..10, &%{id: &1, val: &1 * 10}))
+      right = Dux.from_list([%{id: 3, tag: "three"}, %{id: 7, tag: "seven"}]) |> Dux.compute()
+
+      # Filter before the join — these ops execute as stage 1
+      result =
+        left
+        |> Dux.filter_with("val > 20")
+        |> Dux.join(right, on: :id)
+        |> Dux.Remote.Coordinator.execute(
+          workers: workers,
+          broadcast_threshold: 0
+        )
+        |> Dux.sort_by(:id)
+        |> Dux.to_rows()
+
+      # Only ids 3 and 7 match (both have val > 20)
+      # With replicated source, 2 workers each produce the matching rows
+      ids = Enum.map(result, & &1["id"]) |> Enum.uniq() |> Enum.sort()
+      assert ids == [3, 7]
+      assert Enum.all?(result, &Map.has_key?(&1, "tag"))
     end
   end
 end
