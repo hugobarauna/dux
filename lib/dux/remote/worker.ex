@@ -83,6 +83,24 @@ defmodule Dux.Remote.Worker do
   end
 
   @doc """
+  Hash-partition a pipeline's results into `n_buckets` buckets by join key.
+
+  Returns `%{bucket_id => ipc_binary}` — each bucket contains the rows
+  whose `hash(join_key) % n_buckets == bucket_id`.
+  """
+  def hash_partition(worker, %Dux{} = pipeline, on, n_buckets, timeout \\ :infinity) do
+    GenServer.call(worker, {:hash_partition, pipeline, on, n_buckets}, timeout)
+  end
+
+  @doc """
+  Append an Arrow IPC chunk to a named temp table. Creates the table if
+  it doesn't exist. Used during shuffle exchange.
+  """
+  def append_chunk(worker, table_name, ipc_binary) do
+    GenServer.call(worker, {:append_chunk, table_name, ipc_binary})
+  end
+
+  @doc """
   Get worker info (node, connection status).
   """
   def info(worker) do
@@ -172,6 +190,84 @@ defmodule Dux.Remote.Worker do
   def handle_call({:drop_table, name}, _from, %{db: db} = state) do
     Dux.Native.db_execute(db, "DROP TABLE IF EXISTS \"#{escape_ident(name)}\"")
     {:reply, :ok, %{state | tables: Map.delete(state.tables, name)}}
+  end
+
+  @impl true
+  def handle_call({:hash_partition, pipeline, on_col, n_buckets}, _from, %{db: db} = state) do
+    result =
+      try do
+        # Build and execute the pipeline to get data
+        source_ref = extract_source_ref(pipeline)
+        {sql, source_setup} = Dux.QueryBuilder.build(pipeline, db)
+        Enum.each(source_setup, fn s -> Dux.Native.db_execute(db, s) end)
+
+        col = escape_ident(to_string(on_col))
+
+        # For each bucket, extract rows where hash(key) % n == bucket_id
+        buckets =
+          for bucket_id <- 0..(n_buckets - 1), into: %{} do
+            bucket_sql =
+              "SELECT * EXCLUDE (__bucket) FROM (SELECT *, hash(\"#{col}\") % #{n_buckets} AS __bucket FROM (#{sql}) __src) WHERE __bucket = #{bucket_id}"
+
+            case Dux.Native.df_query(db, bucket_sql) do
+              {:error, _} ->
+                {bucket_id, nil}
+
+              table_ref ->
+                n = Dux.Native.table_n_rows(table_ref)
+
+                if n > 0 do
+                  {bucket_id, Dux.Native.table_to_ipc(table_ref)}
+                else
+                  {bucket_id, nil}
+                end
+            end
+          end
+
+        :erlang.phash2(source_ref, 1)
+        {:ok, buckets}
+      rescue
+        e -> {:error, Exception.message(e)}
+      end
+
+    {:reply, result, state}
+  end
+
+  @impl true
+  def handle_call({:append_chunk, table_name, ipc_binary}, _from, %{db: db} = state) do
+    result =
+      try do
+        table_ref = Dux.Native.table_from_ipc(ipc_binary)
+        Process.put(:dux_append_ref, table_ref)
+        temp = Dux.Native.table_ensure(db, table_ref)
+        escaped = escape_ident(table_name)
+
+        if Map.has_key?(state.tables, table_name) do
+          # Append to existing table
+          Dux.Native.db_execute(db, "INSERT INTO \"#{escaped}\" SELECT * FROM \"#{temp}\"")
+        else
+          # Create new table
+          Dux.Native.db_execute(db, "DROP TABLE IF EXISTS \"#{escaped}\"")
+
+          Dux.Native.db_execute(
+            db,
+            "CREATE TEMPORARY TABLE \"#{escaped}\" AS SELECT * FROM \"#{temp}\""
+          )
+        end
+
+        Process.delete(:dux_append_ref)
+        {:ok, table_name}
+      rescue
+        e -> {:error, Exception.message(e)}
+      end
+
+    tables =
+      case result do
+        {:ok, _} -> Map.put(state.tables, table_name, true)
+        _ -> state.tables
+      end
+
+    {:reply, result, %{state | tables: tables}}
   end
 
   @impl true
