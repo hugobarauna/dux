@@ -36,13 +36,17 @@ defmodule Dux.Remote.Merger do
     # Apply any final operations that need re-aggregation
     final_sql = apply_merge_ops(union_sql, ops)
 
-    case Dux.Native.df_query(db, final_sql) do
-      {:error, reason} ->
-        {:error, reason}
+    result =
+      case Dux.Native.df_query(db, final_sql) do
+        {:error, reason} ->
+          {:error, reason}
 
-      result_ref ->
-        Dux.Native.table_to_ipc(result_ref)
-    end
+        result_ref ->
+          Dux.Native.table_to_ipc(result_ref)
+      end
+
+    _ = table_names
+    result
   end
 
   @doc """
@@ -51,32 +55,36 @@ defmodule Dux.Remote.Merger do
   def merge_to_dux(ipc_results, pipeline) do
     db = Dux.Connection.get_db()
 
-    table_names =
-      ipc_results
-      |> Enum.with_index()
-      |> Enum.map(fn {ipc, _idx} ->
+    # Load each worker result as a temp table.
+    # Keep refs alive in the list to prevent GC before the query runs.
+    input_refs =
+      Enum.map(ipc_results, fn ipc ->
         table_ref = Dux.Native.table_from_ipc(ipc)
         name = Dux.Native.table_ensure(db, table_ref)
         {name, table_ref}
       end)
 
     union_sql =
-      table_names
-      |> Enum.map_join(" UNION ALL ", fn {name, _ref} ->
+      Enum.map_join(input_refs, " UNION ALL ", fn {name, _ref} ->
         ~s(SELECT * FROM "#{name}")
       end)
 
     final_sql = apply_merge_ops(union_sql, pipeline.ops)
 
-    case Dux.Native.df_query(db, final_sql) do
-      {:error, reason} ->
-        raise ArgumentError, "Merge failed: #{reason}"
+    result =
+      case Dux.Native.df_query(db, final_sql) do
+        {:error, reason} ->
+          raise ArgumentError, "Merge failed: #{reason}"
 
-      table_ref ->
-        names = Dux.Native.table_names(table_ref)
-        dtypes = table_ref |> Dux.Native.table_dtypes() |> Map.new()
-        %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes}
-    end
+        table_ref ->
+          names = Dux.Native.table_names(table_ref)
+          dtypes = table_ref |> Dux.Native.table_dtypes() |> Map.new()
+          %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes}
+      end
+
+    # Prevent GC of input refs until after the query completes
+    _ = input_refs
+    result
   end
 
   # ---------------------------------------------------------------------------
