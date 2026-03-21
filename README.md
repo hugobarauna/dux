@@ -153,6 +153,24 @@ tensor = Dux.to_tensor(df, :price)
 
 `Dux` implements `Nx.LazyContainer` for use in `defn`.
 
+## Raw SQL escape hatch
+
+For anything the macro doesn't support — window functions, CASE WHEN, PIVOT, CTEs — use the `_with` variants with raw DuckDB SQL:
+
+```elixir
+# Window functions
+Dux.mutate_with(df, rank: "ROW_NUMBER() OVER (PARTITION BY \"dept\" ORDER BY \"salary\" DESC)")
+
+# CASE WHEN
+Dux.mutate_with(df, tier: "CASE WHEN amount > 1000 THEN 'high' ELSE 'low' END")
+
+# Pivot
+Dux.from_query("PIVOT sales ON product USING SUM(amount) GROUP BY region")
+
+# Any DuckDB SQL
+Dux.from_query("SELECT * FROM read_parquet('s3://bucket/data.parquet') WHERE year = 2025")
+```
+
 ## License
 
 Dual-licensed under Apache 2.0 and MIT. See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).

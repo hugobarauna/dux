@@ -8,7 +8,7 @@ Initial release of Dux — a DuckDB-native dataframe library for Elixir.
 
 - `%Dux{}` struct — the module IS the dataframe
 - Lazy pipelines: operations accumulate, `compute/1` executes
-- CTE-based SQL compilation via `Dux.QueryBuilder`
+- CTE-based SQL compilation via QueryBuilder
 - DuckDB NIF layer via Rustler (connection, query, Arrow IPC, temp tables)
 - Connection GenServer with mutex serialization
 - Perseus-style optimization: `Arc::strong_count()` check for in-place mutation

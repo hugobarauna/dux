@@ -49,18 +49,18 @@ defmodule Dux.MixProject do
 
   defp package do
     [
-      files: [
-        "lib",
-        "native/dux/src",
-        "native/dux/Cargo.toml",
-        "native/dux/Cargo.lock",
-        "checksum-*.exs",
-        "mix.exs",
-        "README.md",
-        "CHANGELOG.md",
-        "LICENSE-APACHE",
-        "LICENSE-MIT"
-      ],
+      files:
+        [
+          "lib",
+          "native/dux/src",
+          "native/dux/Cargo.toml",
+          "native/dux/Cargo.lock",
+          "mix.exs",
+          "README.md",
+          "CHANGELOG.md",
+          "LICENSE-APACHE",
+          "LICENSE-MIT"
+        ] ++ checksum_files(),
       licenses: ["Apache-2.0", "MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -96,6 +96,11 @@ defmodule Dux.MixProject do
         Guides: ~r/guides\/.*/
       ]
     ]
+  end
+
+  # Include checksum files if they exist (generated during release)
+  defp checksum_files do
+    Path.wildcard("checksum-*.exs")
   end
 
   defp aliases do

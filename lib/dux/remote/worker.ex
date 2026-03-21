@@ -8,7 +8,7 @@ defmodule Dux.Remote.Worker do
 
   ## Starting workers
 
-  Workers are started automatically by `Dux.Application` if distributed
+  Workers are started automatically by the application supervisor if distributed
   mode is enabled, or manually:
 
       {:ok, pid} = Dux.Remote.Worker.start_link([])
