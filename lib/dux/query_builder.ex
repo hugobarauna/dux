@@ -55,12 +55,25 @@ defmodule Dux.QueryBuilder do
     end
   end
 
+  defp source_to_sql({:parquet, path, opts}, _db) do
+    escaped = escape_sql_string(path)
+    options = parquet_read_options(opts)
+    {"SELECT * FROM read_parquet('#{escaped}'#{options})", []}
+  end
+
+  # Legacy arity-2 tuple (from old code paths)
   defp source_to_sql({:parquet, path}, _db) do
     {"SELECT * FROM read_parquet('#{escape_sql_string(path)}')", []}
   end
 
-  defp source_to_sql({:csv, path, _opts}, _db) do
-    {"SELECT * FROM read_csv_auto('#{escape_sql_string(path)}')", []}
+  defp source_to_sql({:csv, path, opts}, _db) do
+    escaped = escape_sql_string(path)
+    options = csv_read_options(opts)
+    {"SELECT * FROM read_csv('#{escaped}'#{options})", []}
+  end
+
+  defp source_to_sql({:ndjson, path, _opts}, _db) do
+    {"SELECT * FROM read_json_auto('#{escape_sql_string(path)}')", []}
   end
 
   # ---------------------------------------------------------------------------
@@ -260,4 +273,40 @@ defmodule Dux.QueryBuilder do
   end
 
   defp escape_sql_string(s), do: String.replace(s, "'", "''")
+
+  defp csv_read_options([]), do: ""
+
+  defp csv_read_options(opts) do
+    parts =
+      Enum.flat_map(opts, fn
+        {:delimiter, d} -> ["delim = '#{d}'"]
+        {:header, true} -> ["header = true"]
+        {:header, false} -> ["header = false"]
+        {:skip, n} -> ["skip = #{n}"]
+        {:null_padding, true} -> ["null_padding = true"]
+        {:auto_detect, false} -> ["auto_detect = false"]
+        _ -> []
+      end)
+
+    case parts do
+      [] -> ""
+      _ -> ", " <> Enum.join(parts, ", ")
+    end
+  end
+
+  defp parquet_read_options([]), do: ""
+
+  defp parquet_read_options(opts) do
+    parts =
+      Enum.flat_map(opts, fn
+        {:hive_partitioning, true} -> ["hive_partitioning = true"]
+        {:union_by_name, true} -> ["union_by_name = true"]
+        _ -> []
+      end)
+
+    case parts do
+      [] -> ""
+      _ -> ", " <> Enum.join(parts, ", ")
+    end
+  end
 end

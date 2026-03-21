@@ -86,6 +86,114 @@ defmodule Dux do
   end
 
   # ---------------------------------------------------------------------------
+  # IO — reading
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Read a CSV file.
+
+  All options are passed through to DuckDB's `read_csv()`.
+
+  ## Options
+
+    * `:delimiter` - field delimiter (default: `","`)
+    * `:header` - whether the file has a header row (default: `true`)
+    * `:null_padding` - pad missing columns with NULL (default: `false`)
+    * `:skip` - number of rows to skip at the start
+    * `:columns` - list of column names or indices to read
+    * `:types` - map of column name to DuckDB type string
+    * `:auto_detect` - auto-detect types (default: `true`)
+
+  ## Examples
+
+      df = Dux.from_csv("data/sales.csv")
+      df = Dux.from_csv("data/sales.csv", delimiter: "\\t", skip: 1)
+  """
+  def from_csv(path, opts \\ []) when is_binary(path) do
+    %Dux{source: {:csv, path, opts}}
+  end
+
+  @doc """
+  Read a Parquet file or glob pattern.
+
+  Supports local files, globs, and remote URLs (S3, HTTP) when the
+  appropriate DuckDB extension is loaded (httpfs).
+
+  ## Examples
+
+      df = Dux.from_parquet("data/sales.parquet")
+      df = Dux.from_parquet("data/**/*.parquet")
+      df = Dux.from_parquet("s3://bucket/data/*.parquet")
+  """
+  def from_parquet(path, opts \\ []) when is_binary(path) do
+    %Dux{source: {:parquet, path, opts}}
+  end
+
+  @doc """
+  Read a newline-delimited JSON file.
+
+  ## Examples
+
+      df = Dux.from_ndjson("events.ndjson")
+  """
+  def from_ndjson(path, opts \\ []) when is_binary(path) do
+    %Dux{source: {:ndjson, path, opts}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # IO — writing
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Write a Dux to a CSV file. Triggers computation.
+
+  ## Options
+
+    * `:delimiter` - field delimiter (default: `","`)
+    * `:header` - write header row (default: `true`)
+
+  ## Examples
+
+      Dux.from_query("SELECT * FROM range(10) t(x)")
+      |> Dux.to_csv("/tmp/output.csv")
+  """
+  def to_csv(%Dux{} = dux, path, opts \\ []) when is_binary(path) do
+    write_copy(dux, path, "CSV", opts)
+  end
+
+  @doc """
+  Write a Dux to a Parquet file. Triggers computation.
+
+  ## Options
+
+    * `:compression` - compression codec: `:snappy` (default), `:zstd`, `:gzip`, `:none`
+    * `:row_group_size` - rows per row group
+
+  ## Examples
+
+      Dux.from_query("SELECT * FROM range(10) t(x)")
+      |> Dux.to_parquet("/tmp/output.parquet")
+
+      Dux.from_query("SELECT * FROM range(10) t(x)")
+      |> Dux.to_parquet("/tmp/output.parquet", compression: :zstd)
+  """
+  def to_parquet(%Dux{} = dux, path, opts \\ []) when is_binary(path) do
+    write_copy(dux, path, "PARQUET", opts)
+  end
+
+  @doc """
+  Write a Dux to a newline-delimited JSON file. Triggers computation.
+
+  ## Examples
+
+      Dux.from_query("SELECT * FROM range(10) t(x)")
+      |> Dux.to_ndjson("/tmp/output.ndjson")
+  """
+  def to_ndjson(%Dux{} = dux, path, opts \\ []) when is_binary(path) do
+    write_copy(dux, path, "JSON", opts)
+  end
+
+  # ---------------------------------------------------------------------------
   # Selection verbs
   # ---------------------------------------------------------------------------
 
@@ -499,6 +607,59 @@ defmodule Dux do
   defp encode_param(true), do: "true"
   defp encode_param(false), do: "false"
   defp encode_param(nil), do: "NULL"
+
+  defp write_copy(%Dux{} = dux, path, format, opts) do
+    db = Dux.Connection.get_db()
+    {query_sql, source_setup} = Dux.QueryBuilder.build(dux, db)
+
+    Enum.each(source_setup, fn setup_sql ->
+      Dux.Native.db_execute(db, setup_sql)
+    end)
+
+    copy_opts = build_copy_options(format, opts)
+    escaped_path = String.replace(path, "'", "''")
+    sql = "COPY (#{query_sql}) TO '#{escaped_path}' (#{copy_opts})"
+
+    case Dux.Native.db_execute(db, sql) do
+      {} -> :ok
+      {:error, reason} -> raise ArgumentError, "DuckDB write failed: #{reason}"
+    end
+  end
+
+  defp build_copy_options("CSV", opts) do
+    parts = ["FORMAT CSV"]
+    parts = if Keyword.get(opts, :header, true), do: parts ++ ["HEADER"], else: parts
+
+    parts =
+      case Keyword.get(opts, :delimiter) do
+        nil -> parts
+        d -> parts ++ ["DELIMITER '#{d}'"]
+      end
+
+    Enum.join(parts, ", ")
+  end
+
+  defp build_copy_options("PARQUET", opts) do
+    parts = ["FORMAT PARQUET"]
+
+    parts =
+      case Keyword.get(opts, :compression) do
+        nil -> parts
+        c -> parts ++ ["COMPRESSION #{String.upcase(to_string(c))}"]
+      end
+
+    parts =
+      case Keyword.get(opts, :row_group_size) do
+        nil -> parts
+        n -> parts ++ ["ROW_GROUP_SIZE #{n}"]
+      end
+
+    Enum.join(parts, ", ")
+  end
+
+  defp build_copy_options("JSON", _opts) do
+    "FORMAT JSON"
+  end
 
   defp normalize_sort(col) when is_atom(col), do: [{:asc, to_col_name(col)}]
   defp normalize_sort(col) when is_binary(col), do: [{:asc, col}]
