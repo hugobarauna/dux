@@ -170,6 +170,10 @@ defmodule Dux do
   @doc """
   Keep distinct rows, optionally by specific columns.
 
+  Row ordering is **not** guaranteed after `distinct/1` — use `sort_by/2`
+  if you need deterministic output order. When called with columns,
+  which row is kept for each distinct group is also non-deterministic.
+
       iex> result = Dux.from_list([%{"x" => 1, "y" => "a"}, %{"x" => 1, "y" => "b"}, %{"x" => 2, "y" => "c"}])
       ...> |> Dux.distinct([:x])
       ...> |> Dux.sort_by(:x)
