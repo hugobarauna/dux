@@ -1,4 +1,5 @@
 defmodule Dux.Graph do
+  import Dux.SQL.Helpers, only: [qi: 1]
   alias Dux.Remote.{Coordinator, Worker}
 
   @moduledoc """
@@ -873,9 +874,4 @@ defmodule Dux.Graph do
     end)
   end
 
-  # Escape double quotes in SQL identifiers to prevent injection
-  defp qi(name) do
-    escaped = String.replace(name, ~s("), ~s(""))
-    ~s("#{escaped}")
-  end
 end

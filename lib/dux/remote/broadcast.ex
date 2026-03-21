@@ -27,6 +27,7 @@ defmodule Dux.Remote.Broadcast do
       )
   """
 
+  import Dux.SQL.Helpers, only: [qi: 1]
   alias Dux.Remote.{Merger, Partitioner, Worker}
 
   # Default broadcast threshold: 256MB serialized Arrow IPC
@@ -75,7 +76,7 @@ defmodule Dux.Remote.Broadcast do
     join_pipeline =
       left
       |> Dux.join(
-        Dux.from_query(~s(SELECT * FROM "#{escape_ident(broadcast_name)}")),
+        Dux.from_query("SELECT * FROM #{qi(broadcast_name)}"),
         on: on_spec,
         how: how
       )
@@ -152,5 +153,4 @@ defmodule Dux.Remote.Broadcast do
   defp normalize_on(col) when is_binary(col), do: [String.to_atom(col)]
   defp normalize_on(cols) when is_list(cols), do: cols
 
-  defp escape_ident(name), do: String.replace(name, ~s("), ~s(""))
 end

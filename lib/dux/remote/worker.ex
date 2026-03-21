@@ -28,6 +28,7 @@ defmodule Dux.Remote.Worker do
   """
 
   use GenServer
+  import Dux.SQL.Helpers, only: [qi: 1]
 
   @pg_group :dux_workers
 
@@ -162,13 +163,11 @@ defmodule Dux.Remote.Worker do
         table_ref = Dux.Native.table_from_ipc(ipc_binary)
         Process.put(:dux_register_ref, table_ref)
         temp_name = Dux.Native.table_ensure(db, table_ref)
-        escaped = escape_ident(name)
-
-        Dux.Native.db_execute(db, "DROP TABLE IF EXISTS \"#{escaped}\"")
+        Dux.Native.db_execute(db, "DROP TABLE IF EXISTS #{qi(name)}")
 
         Dux.Native.db_execute(
           db,
-          "CREATE TEMPORARY TABLE \"#{escaped}\" AS SELECT * FROM \"#{temp_name}\""
+          "CREATE TEMPORARY TABLE #{qi(name)} AS SELECT * FROM \"#{temp_name}\""
         )
 
         Process.delete(:dux_register_ref)
@@ -188,7 +187,7 @@ defmodule Dux.Remote.Worker do
 
   @impl true
   def handle_call({:drop_table, name}, _from, %{db: db} = state) do
-    Dux.Native.db_execute(db, "DROP TABLE IF EXISTS \"#{escape_ident(name)}\"")
+    Dux.Native.db_execute(db, "DROP TABLE IF EXISTS #{qi(name)}")
     {:reply, :ok, %{state | tables: Map.delete(state.tables, name)}}
   end
 
@@ -201,13 +200,13 @@ defmodule Dux.Remote.Worker do
         {sql, source_setup} = Dux.QueryBuilder.build(pipeline, db)
         Enum.each(source_setup, fn s -> Dux.Native.db_execute(db, s) end)
 
-        col = escape_ident(to_string(on_col))
+        col = qi(to_string(on_col))
 
         # For each bucket, extract rows where hash(key) % n == bucket_id
         buckets =
           for bucket_id <- 0..(n_buckets - 1), into: %{} do
             bucket_sql =
-              "SELECT * EXCLUDE (__bucket) FROM (SELECT *, hash(\"#{col}\") % #{n_buckets} AS __bucket FROM (#{sql}) __src) WHERE __bucket = #{bucket_id}"
+              "SELECT * EXCLUDE (__bucket) FROM (SELECT *, hash(#{col}) % #{n_buckets} AS __bucket FROM (#{sql}) __src) WHERE __bucket = #{bucket_id}"
 
             case Dux.Native.df_query(db, bucket_sql) do
               {:error, _} ->
@@ -240,18 +239,16 @@ defmodule Dux.Remote.Worker do
         table_ref = Dux.Native.table_from_ipc(ipc_binary)
         Process.put(:dux_append_ref, table_ref)
         temp = Dux.Native.table_ensure(db, table_ref)
-        escaped = escape_ident(table_name)
-
         if Map.has_key?(state.tables, table_name) do
           # Append to existing table
-          Dux.Native.db_execute(db, "INSERT INTO \"#{escaped}\" SELECT * FROM \"#{temp}\"")
+          Dux.Native.db_execute(db, "INSERT INTO #{qi(table_name)} SELECT * FROM \"#{temp}\"")
         else
           # Create new table
-          Dux.Native.db_execute(db, "DROP TABLE IF EXISTS \"#{escaped}\"")
+          Dux.Native.db_execute(db, "DROP TABLE IF EXISTS #{qi(table_name)}")
 
           Dux.Native.db_execute(
             db,
-            "CREATE TEMPORARY TABLE \"#{escaped}\" AS SELECT * FROM \"#{temp}\""
+            "CREATE TEMPORARY TABLE #{qi(table_name)} AS SELECT * FROM \"#{temp}\""
           )
         end
 
@@ -286,8 +283,6 @@ defmodule Dux.Remote.Worker do
     :pg.leave(@pg_group, self())
     :ok
   end
-
-  defp escape_ident(name), do: String.replace(name, ~s("), ~s(""))
 
   defp extract_source_ref(%Dux{source: {:table, ref}}), do: ref
   defp extract_source_ref(_), do: nil

@@ -20,6 +20,7 @@ defmodule Dux.Remote.Coordinator do
   """
 
   alias Dux.Remote.{Merger, Partitioner, PipelineSplitter, Worker}
+  import Dux.SQL.Helpers, only: [qi: 1]
 
   @doc """
   Execute a `%Dux{}` pipeline across distributed workers.
@@ -126,7 +127,7 @@ defmodule Dux.Remote.Coordinator do
     computed_exprs =
       Enum.map(rewrites, fn
         {name, {:avg, sum_col, count_col}} ->
-          {name, "\"#{esc(sum_col)}\" / \"#{esc(count_col)}\""}
+          {name, "#{qi(sum_col)} / #{qi(count_col)}"}
 
         {name, {:stddev, :stddev_samp, n, sum_x, sum_x2}} ->
           {name, stddev_formula(n, sum_x, sum_x2, :samp, true)}
@@ -142,7 +143,7 @@ defmodule Dux.Remote.Coordinator do
 
         {name, {:count_distinct, cd_col, _inner}} ->
           # ARRAY_AGG(DISTINCT) across workers → flatten and count distinct
-          {name, "list_distinct(flatten(list(\"#{esc(cd_col)}\"))).__len"}
+          {name, "list_distinct(flatten(list(#{qi(cd_col)}))).__len"}
       end)
 
     intermediate_cols =
@@ -163,9 +164,9 @@ defmodule Dux.Remote.Coordinator do
   end
 
   defp stddev_formula(n_col, sum_col, sum2_col, pop_or_samp, sqrt?) do
-    n = "\"#{esc(n_col)}\""
-    sx = "\"#{esc(sum_col)}\""
-    sx2 = "\"#{esc(sum2_col)}\""
+    n = qi(n_col)
+    sx = qi(sum_col)
+    sx2 = qi(sum2_col)
 
     divisor = if pop_or_samp == :samp, do: "(#{n} - 1)", else: n
 
@@ -204,5 +205,4 @@ defmodule Dux.Remote.Coordinator do
     %{dux | ops: dux.ops ++ [op]}
   end
 
-  defp esc(name), do: String.replace(name, ~s("), ~s(""))
 end

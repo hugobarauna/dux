@@ -18,6 +18,7 @@ defmodule Dux.Remote.Shuffle do
   Over-partitions by 4x the worker count to absorb moderate skew.
   """
 
+  import Dux.SQL.Helpers, only: [qi: 1]
   alias Dux.Remote.{Merger, Partitioner, Worker}
 
   @over_partition_factor 4
@@ -194,7 +195,7 @@ defmodule Dux.Remote.Shuffle do
   # ---------------------------------------------------------------------------
 
   defp local_join_all(workers, left_prefix, right_prefix, on_col, how, timeout) do
-    escaped_col = escape_ident(on_col)
+    quoted_col = qi(on_col)
     join_type = join_type_sql(how)
 
     # Each worker joins all its left buckets against all its right buckets
@@ -212,15 +213,15 @@ defmodule Dux.Remote.Shuffle do
         else
           # UNION ALL left buckets, UNION ALL right buckets, then join
           left_union =
-            Enum.map_join(left_tables, " UNION ALL ", &~s(SELECT * FROM "#{escape_ident(&1)}"))
+            Enum.map_join(left_tables, " UNION ALL ", &"SELECT * FROM #{qi(&1)}")
 
           right_union =
-            Enum.map_join(right_tables, " UNION ALL ", &~s(SELECT * FROM "#{escape_ident(&1)}"))
+            Enum.map_join(right_tables, " UNION ALL ", &"SELECT * FROM #{qi(&1)}")
 
           join_sql = """
             SELECT * FROM (#{left_union}) __left
             #{join_type} (#{right_union}) __right
-            USING (#{escaped_col})
+            USING (#{quoted_col})
           """
 
           pipeline = Dux.from_query(join_sql)
@@ -259,8 +260,6 @@ defmodule Dux.Remote.Shuffle do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
-  defp escape_ident(name), do: String.replace(name, ~s("), ~s(""))
 
   defp join_type_sql(:inner), do: "INNER JOIN"
   defp join_type_sql(:left), do: "LEFT JOIN"
