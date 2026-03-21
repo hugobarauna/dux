@@ -77,7 +77,6 @@ Uses DuckDB recursive CTEs for efficient BFS from a source vertex:
 Dux.Graph.shortest_paths(graph, 1)
 |> Dux.sort_by(:dist)
 |> Dux.collect()
-# [%{node: 1, dist: 0}, %{node: 2, dist: 1}, ...]
 ```
 
 ### Connected components

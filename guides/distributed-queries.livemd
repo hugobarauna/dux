@@ -38,7 +38,6 @@ Workers auto-register in the `:dux_workers` process group. The coordinator disco
 
 ```elixir
 Dux.Remote.Worker.list()
-# [#PID<0.250.0>, #PID<25759.138.0>, #PID<25760.138.0>]
 ```
 
 ## Executing distributed queries
@@ -119,7 +118,6 @@ You don't need to think about this — it happens transparently.
 ```elixir
 # Assuming 3 worker nodes are connected
 workers = Dux.Remote.Worker.list()
-# [#PID<node1>, #PID<node2>, #PID<node3>]
 
 # Each worker processes its partition independently
 result =

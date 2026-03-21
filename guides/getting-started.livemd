@@ -26,11 +26,6 @@ Dux.from_list([
 |> Dux.filter(salary > 100_000)
 |> Dux.sort_by(desc: :salary)
 |> Dux.collect()
-# [
-#   %{name: "Alice", department: "Engineering", salary: 120000},
-#   %{name: "Bob", department: "Engineering", salary: 110000},
-#   %{name: "Dave", department: "Sales", salary: 105000}
-# ]
 ```
 
 ## Key concepts
@@ -40,13 +35,18 @@ Dux.from_list([
 Operations accumulate in the `%Dux{}` struct. Nothing hits DuckDB until you call `compute/1`, `collect/1`, or `to_columns/1`:
 
 ```elixir
-df = Dux.from_csv("data.csv")
-     |> Dux.filter(x > 10)       # lazy — no SQL yet
-     |> Dux.mutate(y: x * 2)     # lazy — still no SQL
+df =
+  Dux.from_query("SELECT * FROM range(1, 101) t(x)")
+  |> Dux.filter(x > 50)
+  |> Dux.mutate(doubled: x * 2)
 
-df.ops  # [{:filter, ...}, {:mutate, ...}]
+# Inspect the lazy ops — no SQL has run yet
+df.ops
+```
 
-Dux.collect(df)  # NOW the SQL runs
+```elixir
+# NOW the SQL runs
+Dux.collect(df)
 ```
 
 This lets DuckDB see the full pipeline and optimize across operations.
