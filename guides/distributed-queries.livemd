@@ -88,11 +88,11 @@ The broadcast flow:
 4. Pipeline is rewritten to join against the broadcast table
 5. Fan out, merge, cleanup
 
-> #### When to broadcast
-> 
-> Use `Dux.Remote.Broadcast.should_broadcast?(df)` to check if a table
-> is small enough (default threshold: 256MB serialized). For large-large
-> joins, distributed shuffle is planned for a future release.
+> #### Automatic join routing
+>
+> When you `Dux.join/3` a distributed pipeline with a local table, Dux
+> automatically broadcasts it to all workers (if under 256MB) or triggers
+> a distributed shuffle join (if larger). No manual intervention needed.
 
 ## Why not Spark?
 
