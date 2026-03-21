@@ -78,6 +78,7 @@ defmodule Dux.MixProject do
         "guides/getting-started.md",
         "guides/distributed-queries.md",
         "guides/graph-analytics.md",
+        "guides/cheatsheet.cheatmd",
         "CHANGELOG.md"
       ],
       groups_for_modules: [

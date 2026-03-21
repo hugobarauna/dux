@@ -1,0 +1,175 @@
+# Dux Cheatsheet
+
+## Creating Data
+
+### From lists
+```elixir
+Dux.from_list([%{"x" => 1, "y" => "a"}, %{"x" => 2, "y" => "b"}])
+```
+
+### From files
+```elixir
+Dux.from_csv("data.csv")
+Dux.from_parquet("data/**/*.parquet")
+Dux.from_ndjson("events.ndjson")
+```
+
+### From SQL
+```elixir
+Dux.from_query("SELECT * FROM range(100) t(x)")
+```
+
+## Filtering
+
+### Expression syntax
+{: .col-2}
+
+#### Macro (requires `require Dux`)
+```elixir
+Dux.filter(df, x > 10 and status == "active")
+```
+
+#### With interpolation
+```elixir
+min_val = 50
+Dux.filter(df, price > ^min_val)
+```
+
+#### Raw SQL
+```elixir
+Dux.filter_with(df, "x > 10 AND status = 'active'")
+```
+
+## Transformation
+
+### Add columns
+{: .col-2}
+
+#### Macro
+```elixir
+Dux.mutate(df, revenue: price * qty, tax: price * 0.08)
+```
+
+#### Raw SQL
+```elixir
+Dux.mutate_with(df, revenue: "price * qty")
+```
+
+### Other transforms
+```elixir
+Dux.select(df, [:name, :age])        # keep columns
+Dux.discard(df, [:temp])             # drop columns
+Dux.rename(df, old_name: :new_name)  # rename columns
+```
+
+## Sorting & Limiting
+
+```elixir
+Dux.sort_by(df, :name)              # ascending
+Dux.sort_by(df, desc: :score)       # descending
+Dux.sort_by(df, asc: :dept, desc: :salary)  # multi-column
+Dux.head(df, 10)                     # first N rows
+Dux.slice(df, 5, 10)                # offset + limit
+Dux.distinct(df)                     # deduplicate
+```
+
+## Aggregation
+
+### Group + Summarise
+{: .col-2}
+
+#### Macro
+```elixir
+df
+|> Dux.group_by(:region)
+|> Dux.summarise(
+  total: sum(amount),
+  avg: avg(price),
+  n: count(id)
+)
+```
+
+#### Raw SQL
+```elixir
+df
+|> Dux.group_by(:region)
+|> Dux.summarise_with(
+  total: "SUM(amount)",
+  avg: "AVG(price)",
+  n: "COUNT(id)"
+)
+```
+
+## Joins
+
+```elixir
+# Same column name
+Dux.join(left, right, on: :id)
+
+# Different column names
+Dux.join(left, right, on: [{:user_id, :id}])
+
+# Join types
+Dux.join(left, right, on: :id, how: :left)
+# :inner (default), :left, :right, :cross, :anti, :semi
+```
+
+## IO
+
+### Reading
+```elixir
+Dux.from_csv("file.csv", delimiter: "\t")
+Dux.from_parquet("s3://bucket/*.parquet")
+Dux.from_ndjson("events.ndjson")
+```
+
+### Writing
+```elixir
+Dux.to_csv(df, "out.csv")
+Dux.to_parquet(df, "out.parquet", compression: :zstd)
+Dux.to_ndjson(df, "out.ndjson")
+```
+
+## Materialization
+
+```elixir
+Dux.compute(df)     # → %Dux{} with table ref
+Dux.collect(df)     # → [%{col => val}, ...]
+Dux.to_columns(df)  # → %{col => [vals]}
+Dux.n_rows(df)      # → integer
+Dux.sql_preview(df) # → SQL string (no execution)
+```
+
+## Distributed
+
+```elixir
+# Start workers (one per node in production)
+{:ok, _} = Dux.Remote.Worker.start_link()
+
+# Coordinate across cluster
+Dux.Remote.Coordinator.execute(pipeline)
+
+# Broadcast join (star-schema)
+Dux.Remote.Broadcast.execute(fact, dim, on: :id)
+```
+
+## Graph
+
+```elixir
+graph = Dux.Graph.new(vertices: v, edges: e)
+
+Dux.Graph.pagerank(graph)
+Dux.Graph.shortest_paths(graph, start_node)
+Dux.Graph.connected_components(graph)
+Dux.Graph.triangle_count(graph)
+Dux.Graph.out_degree(graph)
+```
+
+## Nx Interop
+
+```elixir
+# Single column → tensor
+tensor = Dux.to_tensor(df, :price)
+
+# Implements Nx.LazyContainer for defn
+```

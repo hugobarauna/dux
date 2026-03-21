@@ -1,11 +1,32 @@
 # Dux
 
-**TODO: Add description**
+**DuckDB-native DataFrames for Elixir.**
+
+Dux is a dataframe library where DuckDB is the execution engine and the BEAM is the distributed runtime. Pipelines are lazy, operations compile to SQL CTEs, and DuckDB handles all the heavy lifting.
+
+```elixir
+require Dux
+
+Dux.from_parquet("s3://data/sales/**/*.parquet")
+|> Dux.filter(amount > 100 and region == ^selected_region)
+|> Dux.mutate(revenue: price * quantity)
+|> Dux.group_by(:product)
+|> Dux.summarise(total: sum(revenue), orders: count(product))
+|> Dux.sort_by(desc: :total)
+|> Dux.to_parquet("results.parquet", compression: :zstd)
+```
+
+## Why Dux?
+
+- **The module IS the dataframe.** `Dux.filter(df, ...)` — no `Dux.DataFrame`, no `Dux.Series`. Just verbs that pipe.
+- **Everything is lazy.** Operations accumulate until `compute/1`. DuckDB optimizes the full pipeline.
+- **DuckDB-only.** No pluggable backends, no abstraction tax. Full access to DuckDB extensions, window functions, recursive CTEs.
+- **Elixir expressions compile to SQL.** `Dux.filter(df, x > ^min_val)` becomes `WHERE x > $1` with parameter bindings. SQL injection safe by construction.
+- **Distributed.** Ship `%Dux{}` structs to any BEAM node, compile to SQL there, execute against that node's local DuckDB. Fan out with the Coordinator, merge results. The spark-killer.
+- **Graph analytics.** `Dux.Graph` — a graph is two dataframes (vertices + edges). PageRank, shortest paths, connected components as verb compositions.
+- **Nx interop.** Numeric columns become tensors via `Nx.LazyContainer`. Zero-copy where possible.
 
 ## Installation
-
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `dux` to your list of dependencies in `mix.exs`:
 
 ```elixir
 def deps do
@@ -15,7 +36,129 @@ def deps do
 end
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/dux>.
+Precompiled NIF binaries are available for macOS (arm64, x86_64), Linux (gnu, musl), and Windows. No Rust or DuckDB compilation needed.
 
+To force a local build (requires Rust toolchain):
+
+```bash
+DUX_BUILD=true mix deps.compile dux --force
+```
+
+## Quick start
+
+```elixir
+require Dux
+
+# Read data
+df = Dux.from_csv("sales.csv")
+
+# Transform
+result =
+  df
+  |> Dux.filter(amount > 100)
+  |> Dux.mutate(tax: amount * 0.08)
+  |> Dux.group_by(:region)
+  |> Dux.summarise(total: sum(amount), avg_tax: avg(tax))
+  |> Dux.sort_by(desc: :total)
+  |> Dux.collect()
+
+# result is a list of maps:
+# [%{"region" => "US", "total" => 15000, "avg_tax" => 120.0}, ...]
+```
+
+## Verbs
+
+All operations are verbs on `%Dux{}` structs:
+
+| Verb | Description |
+|------|-------------|
+| `filter/2` | Filter rows (macro: `filter(df, x > 10)`) |
+| `mutate/2` | Add/replace columns (macro: `mutate(df, y: x * 2)`) |
+| `select/2` | Keep columns |
+| `discard/2` | Drop columns |
+| `sort_by/2` | Sort rows (asc/desc) |
+| `group_by/2` | Group for aggregation |
+| `summarise/2` | Aggregate (macro: `summarise(df, total: sum(x))`) |
+| `join/3` | Inner, left, right, cross, anti, semi joins |
+| `head/2` | First N rows |
+| `distinct/1` | Deduplicate |
+| `rename/2` | Rename columns |
+| `concat_rows/1` | UNION ALL |
+| `compute/1` | Execute the pipeline |
+| `collect/1` | Execute and return list of maps |
+| `to_columns/1` | Execute and return column map |
+
+The `_with` variants (`filter_with/2`, `mutate_with/2`, `summarise_with/2`) accept raw SQL strings for programmatic use.
+
+## IO
+
+DuckDB handles all file formats and remote access natively:
+
+```elixir
+# Read
+Dux.from_csv("data.csv", delimiter: "\t")
+Dux.from_parquet("data/**/*.parquet")
+Dux.from_ndjson("events.ndjson")
+Dux.from_query("SELECT * FROM read_parquet('s3://bucket/data.parquet')")
+
+# Write
+Dux.to_csv(df, "output.csv")
+Dux.to_parquet(df, "output.parquet", compression: :zstd)
+Dux.to_ndjson(df, "output.ndjson")
+```
+
+S3, HTTP, Postgres, MySQL, SQLite — all via DuckDB extensions. No separate libraries needed.
+
+## Distributed queries
+
+Dux distributes analytical workloads across a BEAM cluster:
+
+```elixir
+# Workers auto-register via :pg
+{:ok, _} = Dux.Remote.Worker.start_link()
+
+# Coordinator partitions, fans out, merges
+Dux.from_parquet("data/**/*.parquet")
+|> Dux.filter(amount > 100)
+|> Dux.group_by(:region)
+|> Dux.summarise(total: sum(amount))
+|> Dux.Remote.Coordinator.execute()
+
+# Broadcast joins for star-schema
+Dux.Remote.Broadcast.execute(fact_table, dim_table, on: :region_id)
+```
+
+No function serialization — `%Dux{}` is plain data. Ship it anywhere, compile to SQL there. No cluster manager — just `libcluster` + `:pg`. No heavyweight RPC — just `:erpc.multicall`.
+
+## Graph analytics
+
+```elixir
+graph = Dux.Graph.new(vertices: users, edges: follows)
+
+# All algorithms are verb compositions
+graph |> Dux.Graph.pagerank() |> Dux.sort_by(desc: :rank) |> Dux.head(10)
+graph |> Dux.Graph.shortest_paths(start_node)
+graph |> Dux.Graph.connected_components()
+graph |> Dux.Graph.triangle_count()
+```
+
+## Nx interop
+
+Numeric columns become tensors:
+
+```elixir
+tensor = Dux.to_tensor(df, :price)
+# #Nx.Tensor<f64[1000] [...]>
+```
+
+`Dux` implements `Nx.LazyContainer` for use in `defn`.
+
+## License
+
+Dual-licensed under Apache 2.0 and MIT. See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
+
+## Links
+
+- [Documentation](https://hexdocs.pm/dux)
+- [GitHub](https://github.com/elixir-dux/dux)
+- [Changelog](CHANGELOG.md)

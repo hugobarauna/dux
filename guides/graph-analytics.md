@@ -1,0 +1,149 @@
+# Graph Analytics
+
+`Dux.Graph` provides graph algorithms as compositions of Dux verbs. A graph is just two dataframes — vertices and edges. Every algorithm reduces to joins, aggregations, and iterations that DuckDB executes.
+
+## Creating a graph
+
+```elixir
+vertices = Dux.from_list([
+  %{"id" => 1, "name" => "Alice"},
+  %{"id" => 2, "name" => "Bob"},
+  %{"id" => 3, "name" => "Carol"}
+])
+
+edges = Dux.from_list([
+  %{"src" => 1, "dst" => 2},
+  %{"src" => 2, "dst" => 3},
+  %{"src" => 3, "dst" => 1}
+])
+
+graph = Dux.Graph.new(vertices: vertices, edges: edges)
+```
+
+Custom column names:
+
+```elixir
+Dux.Graph.new(
+  vertices: v,
+  edges: e,
+  vertex_id: :node_id,
+  edge_src: :from,
+  edge_dst: :to
+)
+```
+
+Or infer vertices from edges:
+
+```elixir
+graph = Dux.Graph.from_edgelist(edges)
+```
+
+## Algorithms
+
+### PageRank
+
+Iterative join-aggregate. Each iteration joins edges with current ranks, computes contributions, and updates.
+
+```elixir
+graph
+|> Dux.Graph.pagerank(iterations: 20, damping: 0.85)
+|> Dux.sort_by(desc: :rank)
+|> Dux.head(10)
+|> Dux.collect()
+```
+
+Returns a `%Dux{}` with columns `[vertex_id, rank]`.
+
+> #### Composability {: .tip}
+>
+> Every graph algorithm returns a `%Dux{}` struct. Pipe it into any Dux verb —
+> filter, join with other data, write to Parquet, whatever you need.
+
+### Shortest paths
+
+Uses DuckDB recursive CTEs for efficient BFS from a source vertex:
+
+```elixir
+Dux.Graph.shortest_paths(graph, 1)
+|> Dux.sort_by(:dist)
+|> Dux.collect()
+# [%{"node" => 1, "dist" => 0}, %{"node" => 2, "dist" => 1}, ...]
+```
+
+### Connected components
+
+Iterative label propagation — each vertex takes the minimum label in its neighborhood until convergence:
+
+```elixir
+Dux.Graph.connected_components(graph)
+|> Dux.group_by(:component)
+|> Dux.summarise_with(size: "COUNT(*)")
+|> Dux.sort_by(desc: :size)
+|> Dux.collect()
+```
+
+### Triangle counting
+
+Triple self-join with canonical ordering:
+
+```elixir
+count = Dux.Graph.triangle_count(graph)
+# 1
+```
+
+> #### Bidirectional edges required {: .warning}
+>
+> Triangle counting expects edges in both directions. If your graph is
+> directed, add reverse edges before counting.
+
+### Degree functions
+
+Simple group-by + count:
+
+```elixir
+Dux.Graph.out_degree(graph)  # → %Dux{} with [id, out_degree]
+Dux.Graph.in_degree(graph)   # → %Dux{} with [id, in_degree]
+Dux.Graph.degree(graph)      # → %Dux{} with [id, degree] (in + out)
+```
+
+## Enriching graph results
+
+Since graph algorithms return `%Dux{}` structs, you can join them with other data:
+
+```elixir
+# PageRank + user details
+graph
+|> Dux.Graph.pagerank()
+|> Dux.join(user_details, on: :id)
+|> Dux.filter(rank > 0.01)
+|> Dux.select([:name, :email, :rank])
+|> Dux.sort_by(desc: :rank)
+|> Dux.to_csv("influential_users.csv")
+```
+
+## How it works under the hood
+
+Graph algorithms compile to DuckDB SQL. For example, PageRank becomes:
+
+```sql
+WITH
+  edges AS (...),
+  ranks AS (...),
+  outdeg AS (...),
+  contributions AS (
+    SELECT e.dst AS id, SUM(r.rank / od.out_degree) AS incoming
+    FROM edges e
+    JOIN ranks r ON e.src = r.id
+    JOIN outdeg od ON e.src = od.id
+    GROUP BY e.dst
+  )
+SELECT v.id, COALESCE(base_rank + damping * c.incoming, base_rank) AS rank
+FROM vertices v
+LEFT JOIN contributions c ON v.id = c.id
+```
+
+DuckDB's columnar engine, morsel-driven parallelism, and vectorized execution make this fast — even for graphs with millions of edges.
+
+## Future: DuckPGQ
+
+DuckDB's SQL/PGQ extension (ISO SQL:2023) will provide native graph pattern matching. This is planned for a future Dux release.

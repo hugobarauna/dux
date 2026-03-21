@@ -1,0 +1,193 @@
+# Getting Started
+
+Dux is a DuckDB-native dataframe library for Elixir. This guide walks you through installation, your first pipeline, and the key concepts.
+
+## Installation
+
+Add `dux` to your dependencies:
+
+```elixir
+def deps do
+  [
+    {:dux, "~> 0.1.0"}
+  ]
+end
+```
+
+Precompiled NIF binaries are provided — no Rust or DuckDB compilation needed.
+
+> #### Local builds {: .info}
+>
+> If you need a local build (e.g., for a target not yet supported), set:
+>
+> ```bash
+> DUX_BUILD=true mix deps.compile dux --force
+> ```
+>
+> This requires a Rust toolchain.
+
+## Your first pipeline
+
+```elixir
+require Dux
+
+Dux.from_list([
+  %{"name" => "Alice", "department" => "Engineering", "salary" => 120_000},
+  %{"name" => "Bob", "department" => "Engineering", "salary" => 110_000},
+  %{"name" => "Carol", "department" => "Sales", "salary" => 95_000},
+  %{"name" => "Dave", "department" => "Sales", "salary" => 105_000}
+])
+|> Dux.filter(salary > 100_000)
+|> Dux.sort_by(desc: :salary)
+|> Dux.collect()
+# [
+#   %{"name" => "Alice", "department" => "Engineering", "salary" => 120000},
+#   %{"name" => "Bob", "department" => "Engineering", "salary" => 110000},
+#   %{"name" => "Dave", "department" => "Sales", "salary" => 105000}
+# ]
+```
+
+## Key concepts
+
+### Everything is lazy
+
+Operations accumulate in the `%Dux{}` struct. Nothing hits DuckDB until you call `compute/1`, `collect/1`, or `to_columns/1`:
+
+```elixir
+df = Dux.from_csv("data.csv")
+     |> Dux.filter(x > 10)       # lazy — no SQL yet
+     |> Dux.mutate(y: x * 2)     # lazy — still no SQL
+
+df.ops  # [{:filter, ...}, {:mutate, ...}]
+
+Dux.collect(df)  # NOW the SQL runs
+```
+
+This lets DuckDB see the full pipeline and optimize across operations.
+
+### Expressions compile to SQL
+
+`require Dux` enables the macro versions of `filter`, `mutate`, and `summarise`. Bare identifiers become column names. Use `^` to interpolate Elixir values:
+
+```elixir
+require Dux
+
+min_price = 50
+
+df
+|> Dux.filter(price > ^min_price and category == "Electronics")
+|> Dux.mutate(with_tax: price * 1.08, upper_name: upper(name))
+|> Dux.summarise(total: sum(with_tax), n: count(name))
+```
+
+> #### SQL injection is impossible {: .tip}
+>
+> `^` interpolations become parameter bindings (`$1`, `$2`, ...) in the generated SQL.
+> User values never appear in the SQL string.
+
+### The `_with` variants
+
+For programmatic use, the `_with` variants accept raw SQL strings:
+
+```elixir
+Dux.filter_with(df, "price > 50 AND category = 'Electronics'")
+Dux.mutate_with(df, total: "price * quantity")
+Dux.summarise_with(df, avg_price: "AVG(price)")
+```
+
+## Reading and writing data
+
+### CSV
+
+```elixir
+df = Dux.from_csv("sales.csv")
+df = Dux.from_csv("sales.tsv", delimiter: "\t")
+
+Dux.to_csv(df, "output.csv")
+```
+
+### Parquet
+
+```elixir
+df = Dux.from_parquet("data.parquet")
+df = Dux.from_parquet("data/**/*.parquet")  # glob patterns
+
+Dux.to_parquet(df, "output.parquet", compression: :zstd)
+```
+
+### NDJSON
+
+```elixir
+df = Dux.from_ndjson("events.ndjson")
+Dux.to_ndjson(df, "output.ndjson")
+```
+
+### Remote sources
+
+DuckDB extensions handle S3, HTTP, databases — no separate libraries:
+
+```elixir
+# S3 via httpfs extension
+Dux.Connection.load_extension(:httpfs)
+df = Dux.from_parquet("s3://my-bucket/data/*.parquet")
+
+# PostgreSQL via postgres_scanner
+Dux.Connection.load_extension(:postgres_scanner)
+df = Dux.from_query("SELECT * FROM postgres_scan('dbname=mydb', 'users')")
+```
+
+## Aggregation
+
+Group and aggregate with `group_by` + `summarise`:
+
+```elixir
+require Dux
+
+Dux.from_csv("orders.csv")
+|> Dux.group_by(:product)
+|> Dux.summarise(
+  total_revenue: sum(price * quantity),
+  order_count: count(id),
+  avg_price: avg(price)
+)
+|> Dux.sort_by(desc: :total_revenue)
+|> Dux.collect()
+```
+
+## Joins
+
+```elixir
+orders = Dux.from_csv("orders.csv")
+customers = Dux.from_csv("customers.csv")
+
+orders
+|> Dux.join(customers, on: :customer_id)
+|> Dux.select([:order_id, :customer_name, :total])
+|> Dux.collect()
+```
+
+Join types: `:inner` (default), `:left`, `:right`, `:cross`, `:anti`, `:semi`.
+
+For columns with different names:
+
+```elixir
+Dux.join(orders, products, on: [{:product_id, :id}])
+```
+
+## Debugging with sql_preview
+
+See the generated SQL without executing:
+
+```elixir
+Dux.from_csv("data.csv")
+|> Dux.filter(x > 10)
+|> Dux.mutate(y: x * 2)
+|> Dux.sql_preview()
+# "WITH\n  __s0 AS (SELECT * FROM ...)\n  __s1 AS (...)\nSELECT * FROM __s1"
+```
+
+## Next steps
+
+- [Distributed Queries](distributed-queries.md) — run Dux across a BEAM cluster
+- [Graph Analytics](graph-analytics.md) — PageRank, shortest paths, and more
+- [API Reference](Dux.html) — full module documentation
