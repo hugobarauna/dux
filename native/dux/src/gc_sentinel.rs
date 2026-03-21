@@ -1,5 +1,5 @@
-use rustler::{Env, LocalPid, OwnedEnv, Resource, ResourceArc, Term};
 use rustler::env::SavedTerm;
+use rustler::{Env, LocalPid, OwnedEnv, Resource, ResourceArc, Term};
 use std::sync::Mutex;
 
 /// A NIF resource that sends a pre-built message to a local PID when
@@ -35,9 +35,7 @@ impl Drop for GcSentinelRef {
                     let pid = inner.pid;
                     let msg = inner.msg;
                     let mut owned_env = inner.owned_env;
-                    let _ = owned_env.send_and_clear(&pid, |env| {
-                        msg.load(env)
-                    });
+                    let _ = owned_env.send_and_clear(&pid, |env| msg.load(env));
                 });
             }
         }

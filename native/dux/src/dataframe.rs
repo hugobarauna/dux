@@ -126,7 +126,12 @@ fn table_dtypes(env: Env, table: DuxTable) -> Vec<(String, Term)> {
         .schema
         .fields()
         .iter()
-        .map(|f| (f.name().clone(), types::arrow_dtype_to_term(env, f.data_type())))
+        .map(|f| {
+            (
+                f.name().clone(),
+                types::arrow_dtype_to_term(env, f.data_type()),
+            )
+        })
         .collect()
 }
 
@@ -232,8 +237,7 @@ fn register_table_impl(db: &DuxDb, table: &DuxTable, table_name: &str) -> Result
             })
             .collect();
 
-        let all_arrays =
-            all_arrays.map_err(|e| DuxError::Other(format!("concat arrays: {e}")))?;
+        let all_arrays = all_arrays.map_err(|e| DuxError::Other(format!("concat arrays: {e}")))?;
 
         let combined = RecordBatch::try_new(schema.clone(), all_arrays)
             .map_err(|e| DuxError::Other(format!("concat: {e}")))?;
@@ -264,9 +268,7 @@ fn register_table_impl(db: &DuxDb, table: &DuxTable, table_name: &str) -> Result
         ))
         .map_err(DuxError::DuckDB)?;
 
-        let mut appender = conn
-            .appender(table_name)
-            .map_err(DuxError::DuckDB)?;
+        let mut appender = conn.appender(table_name).map_err(DuxError::DuckDB)?;
 
         for batch in &table.resource.batches {
             appender
@@ -374,13 +376,11 @@ fn table_from_ipc(binary: rustler::Binary) -> Result<DuxTable, NifError> {
     use std::io::Cursor;
 
     let cursor = Cursor::new(binary.as_slice());
-    let reader =
-        StreamReader::try_new(cursor, None).map_err(|e| DuxError::Other(format!("IPC read: {e}")))?;
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| DuxError::Other(format!("IPC read: {e}")))?;
 
     let schema = reader.schema();
-    let batches: Vec<RecordBatch> = reader
-        .filter_map(|r| r.ok())
-        .collect();
+    let batches: Vec<RecordBatch> = reader.filter_map(|r| r.ok()).collect();
 
     Ok(DuxTable::new(batches, schema))
 }
@@ -518,14 +518,10 @@ pub fn array_value_to_term<'a>(env: Env<'a>, array: &dyn Array, idx: usize) -> T
                 let value = array_value_to_term(env, col.as_ref(), idx);
                 map_entries.push((field.name().as_str().encode(env), value));
             }
-            Term::map_from_pairs(env, &map_entries)
-                .unwrap_or_else(|_| atoms::nil().encode(env))
+            Term::map_from_pairs(env, &map_entries).unwrap_or_else(|_| atoms::nil().encode(env))
         }
         DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             let raw = arr.value(idx);
             if *scale == 0 {
                 // Integer-valued decimal: return as i64
