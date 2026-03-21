@@ -57,13 +57,14 @@ defmodule Dux.Connection do
 
   @impl true
   def handle_call({:execute, sql}, _from, %{db: db} = state) do
-    result = Dux.Native.db_execute(db, sql)
-    {:reply, result, state}
+    case Dux.Native.db_execute(db, sql) do
+      {} -> {:reply, :ok, state}
+      {:error, _} = err -> {:reply, err, state}
+    end
   end
 
   @impl true
   def handle_call({:query, sql}, _from, %{db: db} = state) do
-    result = Dux.Native.df_query(db, sql)
-    {:reply, result, state}
+    {:reply, Dux.Native.df_query(db, sql), state}
   end
 end
