@@ -37,7 +37,7 @@ Initial release of Dux — a DuckDB-native dataframe library for Elixir.
 - `to_csv/3`, `to_parquet/3`, `to_ndjson/3` — sinks via COPY
 - DuckDB extensions for S3, HTTP, Postgres, MySQL, SQLite
 
-### Distributed (spark-killer)
+### Distributed
 
 - `Dux.Remote.Worker` — DuckDB per BEAM node, `:pg` discovery
 - `Dux.Remote.Coordinator` — partition, fan-out, merge

@@ -22,7 +22,7 @@ Dux.from_parquet("s3://data/sales/**/*.parquet")
 - **Everything is lazy.** Operations accumulate until `compute/1`. DuckDB optimizes the full pipeline.
 - **DuckDB-only.** No pluggable backends, no abstraction tax. Full access to DuckDB extensions, window functions, recursive CTEs.
 - **Elixir expressions compile to SQL.** `Dux.filter(df, x > ^min_val)` becomes `WHERE x > $1` with parameter bindings. SQL injection safe by construction.
-- **Distributed.** Ship `%Dux{}` structs to any BEAM node, compile to SQL there, execute against that node's local DuckDB. Fan out with the Coordinator, merge results. The spark-killer.
+- **Distributed.** Ship `%Dux{}` structs to any BEAM node, compile to SQL there, execute against that node's local DuckDB. Fan out with the Coordinator, merge results.
 - **Graph analytics.** `Dux.Graph` — a graph is two dataframes (vertices + edges). PageRank, shortest paths, connected components as verb compositions.
 - **Nx interop.** Numeric columns become tensors via `Nx.LazyContainer`. Zero-copy where possible.
 
