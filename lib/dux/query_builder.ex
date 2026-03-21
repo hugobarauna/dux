@@ -205,6 +205,22 @@ defmodule Dux.QueryBuilder do
     {"SELECT #{select_cols} FROM #{prev}#{group_clause}", []}
   end
 
+  defp op_to_sql({:pivot_wider, names_col, values_col, agg}, prev, groups) do
+    # DuckDB PIVOT syntax
+    sql = "PIVOT #{prev} ON #{quote_ident(names_col)} USING #{agg}(#{quote_ident(values_col)})"
+    {sql, groups}
+  end
+
+  defp op_to_sql({:pivot_longer, cols, names_to, values_to}, prev, groups) do
+    # DuckDB UNPIVOT syntax
+    col_list = Enum.map_join(cols, ", ", &quote_ident/1)
+
+    sql =
+      "UNPIVOT #{prev} ON #{col_list} INTO NAME #{quote_ident(names_to)} VALUE #{quote_ident(values_to)}"
+
+    {sql, groups}
+  end
+
   defp op_to_sql({:join, right, how, on_cols, _suffix}, prev, groups) do
     # The right side is inlined as a subquery
     right_db = Dux.Connection.get_db()

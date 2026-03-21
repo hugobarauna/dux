@@ -579,6 +579,63 @@ defmodule Dux do
   end
 
   # ---------------------------------------------------------------------------
+  # Reshape
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Pivot from long to wide format (PIVOT).
+
+  Takes values from `values_from` column and spreads them into new columns
+  named by the `names_from` column, aggregated with `agg_func`.
+
+  ## Options
+
+    * `:agg` — aggregation function (default: `"SUM"`)
+
+  ## Examples
+
+      iex> Dux.from_list([
+      ...>   %{region: "US", product: "Widget", sales: 100},
+      ...>   %{region: "US", product: "Gadget", sales: 200},
+      ...>   %{region: "EU", product: "Widget", sales: 150}
+      ...> ])
+      ...> |> Dux.pivot_wider(:product, :sales)
+      ...> |> Dux.sort_by(:region)
+      ...> |> Dux.collect()
+      [%{"Gadget" => nil, "Widget" => 150, "region" => "EU"}, %{"Gadget" => 200, "Widget" => 100, "region" => "US"}]
+  """
+  def pivot_wider(%Dux{ops: ops} = dux, names_from, values_from, opts \\ []) do
+    agg = Keyword.get(opts, :agg, "SUM")
+    names_col = to_col_name(names_from)
+    values_col = to_col_name(values_from)
+    %{dux | ops: ops ++ [{:pivot_wider, names_col, values_col, agg}]}
+  end
+
+  @doc """
+  Unpivot from wide to long format (UNPIVOT).
+
+  Takes multiple columns and stacks them into two columns: one for the
+  original column name and one for the value.
+
+  ## Examples
+
+      iex> Dux.from_list([
+      ...>   %{region: "US", q1: 100, q2: 200},
+      ...>   %{region: "EU", q1: 150, q2: 250}
+      ...> ])
+      ...> |> Dux.pivot_longer([:q1, :q2], names_to: "quarter", values_to: "sales")
+      ...> |> Dux.sort_by([:region, :quarter])
+      ...> |> Dux.collect()
+      [%{"quarter" => "q1", "region" => "EU", "sales" => 150}, %{"quarter" => "q2", "region" => "EU", "sales" => 250}, %{"quarter" => "q1", "region" => "US", "sales" => 100}, %{"quarter" => "q2", "region" => "US", "sales" => 200}]
+  """
+  def pivot_longer(%Dux{ops: ops} = dux, columns, opts \\ []) do
+    cols = Enum.map(columns, &to_col_name/1)
+    names_to = Keyword.get(opts, :names_to, "name")
+    values_to = Keyword.get(opts, :values_to, "value")
+    %{dux | ops: ops ++ [{:pivot_longer, cols, names_to, values_to}]}
+  end
+
+  # ---------------------------------------------------------------------------
   # Concatenation
   # ---------------------------------------------------------------------------
 
