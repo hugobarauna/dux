@@ -188,12 +188,20 @@ defmodule Dux.Graph do
   def pagerank(%__MODULE__{} = graph, opts \\ []) do
     damping = Keyword.get(opts, :damping, 0.85)
     iterations = Keyword.get(opts, :iterations, 20)
+    workers = Keyword.get(opts, :workers)
 
+    if workers do
+      pagerank_distributed(graph, damping, iterations, workers)
+    else
+      pagerank_local(graph, damping, iterations)
+    end
+  end
+
+  defp pagerank_local(graph, damping, iterations) do
     vid = graph.vertex_id
     src = graph.edge_src
     dst = graph.edge_dst
 
-    # Count vertices
     n =
       graph.vertices
       |> Dux.summarise_with(n: "COUNT(*)")
@@ -201,10 +209,7 @@ defmodule Dux.Graph do
       |> hd()
       |> Map.get("n")
 
-    # Compute out-degree and materialize
     out_deg = out_degree(graph) |> Dux.compute()
-
-    # Initialize ranks: 1/n for every vertex
     initial_rank = 1.0 / n
 
     ranks =
@@ -215,12 +220,10 @@ defmodule Dux.Graph do
 
     base_rank = (1.0 - damping) / n
 
-    # Iterative PageRank using SQL joins.
-    # The accumulator carries {current_ranks, out_deg, all_prev_ranks} to keep
-    # ResourceArc references alive and prevent Erlang GC from dropping temp tables.
     {final, kept_out_deg, kept_prev} =
       Enum.reduce(1..iterations, {ranks, out_deg, [ranks]}, fn _i, {ranks, out_deg, prev} ->
         db = Dux.Connection.get_db()
+        Process.put(:dux_compute_ref, {ranks.source, out_deg.source})
 
         {:table, ranks_ref} = ranks.source
         ranks_table = Dux.Native.table_ensure(db, ranks_ref)
@@ -252,14 +255,106 @@ defmodule Dux.Graph do
         """
 
         new_ranks = Dux.from_query(sql) |> Dux.compute()
+        Process.delete(:dux_compute_ref)
         {new_ranks, out_deg, [new_ranks | prev]}
       end)
 
-    # Ensure kept refs survive until after final is returned.
-    # Without this, BEAM GC may collect the ResourceArcs mid-iteration.
     :erlang.garbage_collect()
     _ = {kept_out_deg, kept_prev}
     final
+  end
+
+  defp pagerank_distributed(graph, damping, iterations, workers) do
+    vid = graph.vertex_id
+    src = graph.edge_src
+    dst = graph.edge_dst
+
+    n =
+      graph.vertices
+      |> Dux.summarise_with(n: "COUNT(*)")
+      |> Dux.collect()
+      |> hd()
+      |> Map.get("n")
+
+    initial_rank = 1.0 / n
+    base_rank = (1.0 - damping) / n
+
+    # Initialize ranks
+    ranks =
+      graph.vertices
+      |> Dux.select([String.to_atom(vid)])
+      |> Dux.mutate_with(rank: "#{initial_rank}")
+      |> Dux.compute()
+
+    # Compute out-degree
+    out_deg = out_degree(graph) |> Dux.compute()
+
+    # Each iteration: broadcast ranks + out_deg to workers,
+    # workers compute contributions from their edges,
+    # coordinator merges and updates ranks
+    Enum.reduce(1..iterations, ranks, fn _i, ranks ->
+      # Broadcast current ranks and out_degree to all workers
+      {:table, ranks_ref} = ranks.source
+      ranks_ipc = Dux.Native.table_to_ipc(ranks_ref)
+
+      {:table, outdeg_ref} = out_deg.source
+      outdeg_ipc = Dux.Native.table_to_ipc(outdeg_ref)
+
+      stage = :erlang.unique_integer([:positive])
+
+      tasks =
+        Enum.map(workers, fn w ->
+          Task.async(fn ->
+            Dux.Remote.Worker.register_table(w, "__pr_ranks_#{stage}", ranks_ipc)
+            Dux.Remote.Worker.register_table(w, "__pr_outdeg_#{stage}", outdeg_ipc)
+          end)
+        end)
+
+      Task.await_many(tasks, 30_000)
+
+      # Each worker computes contributions from its copy of the edges
+      contribution_pipeline =
+        graph.edges
+        |> Dux.join(
+          Dux.from_query(~s(SELECT * FROM "__pr_ranks_#{stage}")),
+          on: [{String.to_atom(src), String.to_atom(vid)}]
+        )
+        |> Dux.join(
+          Dux.from_query(~s(SELECT * FROM "__pr_outdeg_#{stage}")),
+          on: [{String.to_atom(src), String.to_atom(vid)}]
+        )
+        |> Dux.mutate_with(contribution: "\"rank\" / \"out_degree\"")
+        |> Dux.group_by(String.to_atom(dst))
+        |> Dux.summarise_with(incoming: "SUM(contribution)")
+
+      # Fan out, merge contributions, then rename on coordinator
+      contributions =
+        Dux.Remote.Coordinator.execute(contribution_pipeline, workers: workers)
+        |> Dux.rename([{String.to_atom(dst), String.to_atom(vid)}])
+        |> Dux.compute()
+
+      # Compute new ranks on coordinator: base_rank + damping * incoming
+      # Left join with vertices to ensure all vertices get a rank
+      new_ranks =
+        graph.vertices
+        |> Dux.select([String.to_atom(vid)])
+        |> Dux.join(contributions, on: String.to_atom(vid), how: :left)
+        |> Dux.mutate_with(rank: "COALESCE(#{base_rank} + #{damping} * incoming, #{base_rank})")
+        |> Dux.select([String.to_atom(vid), :rank])
+        |> Dux.compute()
+
+      # Cleanup broadcast tables
+      Enum.each(workers, fn w ->
+        try do
+          Dux.Remote.Worker.drop_table(w, "__pr_ranks_#{stage}")
+          Dux.Remote.Worker.drop_table(w, "__pr_outdeg_#{stage}")
+        catch
+          _, _ -> :ok
+        end
+      end)
+
+      new_ranks
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -335,6 +430,9 @@ defmodule Dux.Graph do
   """
   def connected_components(%__MODULE__{} = graph, opts \\ []) do
     max_iterations = Keyword.get(opts, :max_iterations, 100)
+    # Connected components stays local for now — the iterative SQL
+    # references local temp tables that can't be distributed.
+    # TODO: implement broadcast pattern like pagerank_distributed
     vid = graph.vertex_id
     src = graph.edge_src
     dst = graph.edge_dst
@@ -467,6 +565,13 @@ defmodule Dux.Graph do
   """
   def edge_count(%__MODULE__{} = graph) do
     Dux.n_rows(graph.edges)
+  end
+
+  # Compute locally or distributed depending on workers option
+  defp do_compute(dux, nil), do: Dux.compute(dux)
+
+  defp do_compute(dux, workers) when is_list(workers) do
+    Dux.Remote.Coordinator.execute(dux, workers: workers)
   end
 
   # Escape double quotes in SQL identifiers to prevent injection
