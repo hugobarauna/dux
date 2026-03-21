@@ -78,7 +78,9 @@ defmodule Dux.ConnectionTest do
     end
 
     test "query returns error on non-existent table", %{conn: conn} do
-      assert {:error, reason} = Dux.Connection.query("SELECT * FROM this_table_does_not_exist", conn)
+      assert {:error, reason} =
+               Dux.Connection.query("SELECT * FROM this_table_does_not_exist", conn)
+
       assert is_binary(reason)
     end
   end
@@ -88,6 +90,7 @@ defmodule Dux.ConnectionTest do
   describe "adversarial" do
     test "concurrent queries don't corrupt state", %{conn: conn} do
       Dux.Connection.execute("CREATE TABLE concurrent_test (id INTEGER)", conn)
+
       Dux.Connection.execute(
         "INSERT INTO concurrent_test SELECT * FROM range(1000)",
         conn

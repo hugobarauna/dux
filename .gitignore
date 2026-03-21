@@ -20,6 +20,9 @@ dux-*.tar
 /.claude/
 /AGENTS.md
 
+# Tool versions
+.mise.toml
+
 # Editor / OS
 .DS_Store
 .elixir_ls/

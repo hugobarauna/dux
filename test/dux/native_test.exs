@@ -15,7 +15,11 @@ defmodule Dux.NativeTest do
     end
 
     test "opens file-backed database" do
-      path = Path.join(System.tmp_dir!(), "dux_native_test_#{System.unique_integer([:positive])}.duckdb")
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "dux_native_test_#{System.unique_integer([:positive])}.duckdb"
+        )
 
       try do
         db = Dux.Native.db_open_path(path)
@@ -77,27 +81,33 @@ defmodule Dux.NativeTest do
     end
 
     test "handles multiple types", %{db: db} do
-      table = Dux.Native.df_query(db, """
-        SELECT
-          42::BIGINT AS i,
-          3.14::DOUBLE AS f,
-          'hello'::VARCHAR AS s,
-          true AS b
-      """)
+      table =
+        Dux.Native.df_query(db, """
+          SELECT
+            42::BIGINT AS i,
+            3.14::DOUBLE AS f,
+            'hello'::VARCHAR AS s,
+            true AS b
+        """)
+
       columns = Dux.Native.table_to_columns(table)
       assert %{"i" => [42], "f" => [f], "s" => ["hello"], "b" => [true]} = columns
       assert_in_delta f, 3.14, 0.001
     end
 
     test "handles float special values", %{db: db} do
-      table = Dux.Native.df_query(db, """
-        SELECT
-          'NaN'::DOUBLE AS nan_val,
-          'Infinity'::DOUBLE AS inf_val,
-          '-Infinity'::DOUBLE AS neg_inf_val
-      """)
+      table =
+        Dux.Native.df_query(db, """
+          SELECT
+            'NaN'::DOUBLE AS nan_val,
+            'Infinity'::DOUBLE AS inf_val,
+            '-Infinity'::DOUBLE AS neg_inf_val
+        """)
+
       columns = Dux.Native.table_to_columns(table)
-      assert %{"nan_val" => [:nan], "inf_val" => [:infinity], "neg_inf_val" => [:neg_infinity]} = columns
+
+      assert %{"nan_val" => [:nan], "inf_val" => [:infinity], "neg_inf_val" => [:neg_infinity]} =
+               columns
     end
   end
 
@@ -162,10 +172,10 @@ defmodule Dux.NativeTest do
     end
 
     test "round-trips large dataset", %{db: db} do
-      table = Dux.Native.df_query(db, "SELECT x, x * 2 AS doubled FROM range(10000) t(x)")
+      table = Dux.Native.df_query(db, "SELECT x, x * 2 AS doubled FROM range(10_000) t(x)")
       ipc = Dux.Native.table_to_ipc(table)
       restored = Dux.Native.table_from_ipc(ipc)
-      assert Dux.Native.table_n_rows(restored) == 10000
+      assert Dux.Native.table_n_rows(restored) == 10_000
     end
   end
 

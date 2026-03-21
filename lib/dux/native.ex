@@ -7,7 +7,7 @@ defmodule Dux.Native do
     mode: :release
 
   # Database lifecycle
-  def db_open(), do: :erlang.nif_error(:nif_not_loaded)
+  def db_open, do: :erlang.nif_error(:nif_not_loaded)
   def db_open_path(_path), do: :erlang.nif_error(:nif_not_loaded)
   def db_execute(_db, _sql), do: :erlang.nif_error(:nif_not_loaded)
 
