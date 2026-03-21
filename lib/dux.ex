@@ -122,8 +122,7 @@ defmodule Dux do
   @doc """
   Filter rows matching a condition.
 
-  Accepts a SQL expression string. The Query macro (brief 1c) will add
-  Elixir expression syntax.
+  Accepts a SQL expression string or a `{sql, params}` tuple from the query compiler.
 
       iex> Dux.from_query("SELECT * FROM range(1, 6) t(x)")
       ...> |> Dux.filter("x > 3")
@@ -137,6 +136,10 @@ defmodule Dux do
   """
   def filter(%Dux{ops: ops} = dux, expr) when is_binary(expr) do
     %{dux | ops: ops ++ [{:filter, expr}]}
+  end
+
+  def filter(%Dux{ops: ops} = dux, {sql, params}) when is_binary(sql) and is_list(params) do
+    %{dux | ops: ops ++ [{:filter, inline_params(sql, params)}]}
   end
 
   @doc """
@@ -169,6 +172,7 @@ defmodule Dux do
 
       iex> result = Dux.from_list([%{"x" => 1, "y" => "a"}, %{"x" => 1, "y" => "b"}, %{"x" => 2, "y" => "c"}])
       ...> |> Dux.distinct([:x])
+      ...> |> Dux.sort_by(:x)
       ...> |> Dux.to_columns()
       iex> result["x"]
       [1, 2]
@@ -214,7 +218,7 @@ defmodule Dux do
   def mutate(%Dux{ops: ops} = dux, exprs) when is_list(exprs) do
     assignments =
       Enum.map(exprs, fn {name, expr} ->
-        {to_col_name(name), expr}
+        {to_col_name(name), resolve_expr(expr)}
       end)
 
     %{dux | ops: ops ++ [{:mutate, assignments}]}
@@ -312,7 +316,7 @@ defmodule Dux do
   def summarise(%Dux{ops: ops} = dux, aggs) when is_list(aggs) do
     assignments =
       Enum.map(aggs, fn {name, expr} ->
-        {to_col_name(name), expr}
+        {to_col_name(name), resolve_expr(expr)}
       end)
 
     %{dux | ops: ops ++ [{:summarise, assignments}]}
@@ -469,6 +473,28 @@ defmodule Dux do
 
   defp to_col_name(name) when is_atom(name), do: Atom.to_string(name)
   defp to_col_name(name) when is_binary(name), do: name
+
+  defp resolve_expr(expr) when is_binary(expr), do: expr
+
+  defp resolve_expr({sql, params}) when is_binary(sql) and is_list(params),
+    do: inline_params(sql, params)
+
+  defp inline_params(sql, []), do: sql
+
+  defp inline_params(sql, params) do
+    params
+    |> Enum.with_index(1)
+    |> Enum.reduce(sql, fn {value, idx}, sql ->
+      String.replace(sql, "$#{idx}", encode_param(value))
+    end)
+  end
+
+  defp encode_param(v) when is_integer(v), do: Integer.to_string(v)
+  defp encode_param(v) when is_float(v), do: Float.to_string(v)
+  defp encode_param(v) when is_binary(v), do: "'#{String.replace(v, "'", "''")}'"
+  defp encode_param(true), do: "true"
+  defp encode_param(false), do: "false"
+  defp encode_param(nil), do: "NULL"
 
   defp normalize_sort(col) when is_atom(col), do: [{:asc, to_col_name(col)}]
   defp normalize_sort(col) when is_binary(col), do: [{:asc, col}]
