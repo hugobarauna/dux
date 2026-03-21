@@ -72,10 +72,10 @@ defmodule Dux.Graph do
     {edges_sql, _} = Dux.QueryBuilder.build(edges, db)
 
     vertices_sql = """
-      SELECT DISTINCT "#{id_col}" FROM (
-        SELECT "#{src_col}" AS "#{id_col}" FROM (#{edges_sql}) __e1
+      SELECT DISTINCT #{qi(id_col)} FROM (
+        SELECT #{qi(src_col)} AS #{qi(id_col)} FROM (#{edges_sql}) __e1
         UNION
-        SELECT "#{dst_col}" AS "#{id_col}" FROM (#{edges_sql}) __e2
+        SELECT #{qi(dst_col)} AS #{qi(id_col)} FROM (#{edges_sql}) __e2
       ) __combined
     """
 
@@ -144,12 +144,12 @@ defmodule Dux.Graph do
     {edges_sql, _} = Dux.QueryBuilder.build(graph.edges, db)
 
     sql = """
-      SELECT "#{vid}", CAST(COUNT(*) AS BIGINT) AS degree FROM (
-        SELECT "#{src}" AS "#{vid}" FROM (#{edges_sql}) __e1
+      SELECT #{qi(vid)}, CAST(COUNT(*) AS BIGINT) AS degree FROM (
+        SELECT #{qi(src)} AS #{qi(vid)} FROM (#{edges_sql}) __e1
         UNION ALL
-        SELECT "#{dst}" AS "#{vid}" FROM (#{edges_sql}) __e2
+        SELECT #{qi(dst)} AS #{qi(vid)} FROM (#{edges_sql}) __e2
       ) __all_edges
-      GROUP BY "#{vid}"
+      GROUP BY #{qi(vid)}
     """
 
     Dux.from_query(sql)
@@ -215,13 +215,13 @@ defmodule Dux.Graph do
 
     base_rank = (1.0 - damping) / n
 
-    # Iterative PageRank using SQL joins
-    # We keep all intermediate results alive to prevent GC of temp tables
-    {final, _history} =
-      Enum.reduce(1..iterations, {ranks, [ranks, out_deg]}, fn _i, {ranks, history} ->
+    # Iterative PageRank using SQL joins.
+    # The accumulator carries {current_ranks, out_deg, all_prev_ranks} to keep
+    # ResourceArc references alive and prevent Erlang GC from dropping temp tables.
+    {final, _out_deg, _prev} =
+      Enum.reduce(1..iterations, {ranks, out_deg, [ranks]}, fn _i, {ranks, out_deg, prev} ->
         db = Dux.Connection.get_db()
 
-        # Ensure temp tables exist for all referenced Dux structs
         {:table, ranks_ref} = ranks.source
         ranks_table = Dux.Native.table_ensure(db, ranks_ref)
 
@@ -237,22 +237,22 @@ defmodule Dux.Graph do
             verts AS (#{verts_sql}),
             contributions AS (
               SELECT
-                e."#{dst}" AS "#{vid}",
+                e.#{qi(dst)} AS #{qi(vid)},
                 SUM(r."rank" / od."out_degree") AS incoming
               FROM edges e
-              JOIN "#{ranks_table}" r ON e."#{src}" = r."#{vid}"
-              JOIN "#{outdeg_table}" od ON e."#{src}" = od."#{vid}"
-              GROUP BY e."#{dst}"
+              JOIN "#{ranks_table}" r ON e.#{qi(src)} = r.#{qi(vid)}
+              JOIN "#{outdeg_table}" od ON e.#{qi(src)} = od.#{qi(vid)}
+              GROUP BY e.#{qi(dst)}
             )
           SELECT
-            v."#{vid}",
+            v.#{qi(vid)},
             COALESCE(#{base_rank} + #{damping} * c.incoming, #{base_rank}) AS "rank"
           FROM verts v
-          LEFT JOIN contributions c ON v."#{vid}" = c."#{vid}"
+          LEFT JOIN contributions c ON v.#{qi(vid)} = c.#{qi(vid)}
         """
 
         new_ranks = Dux.from_query(sql) |> Dux.compute()
-        {new_ranks, [new_ranks | history]}
+        {new_ranks, out_deg, [new_ranks | prev]}
       end)
 
     final
@@ -294,9 +294,9 @@ defmodule Dux.Graph do
       paths AS (
         SELECT #{from_vertex} AS node, 0 AS dist
         UNION
-        SELECT e."#{dst}" AS node, p.dist + 1
+        SELECT e.#{qi(dst)} AS node, p.dist + 1
         FROM paths p
-        JOIN edges_cte e ON p.node = e."#{src}"
+        JOIN edges_cte e ON p.node = e.#{qi(src)}
         WHERE p.dist < 1000
       )
     SELECT node, MIN(dist) AS dist FROM paths GROUP BY node
@@ -341,7 +341,7 @@ defmodule Dux.Graph do
     labels =
       graph.vertices
       |> Dux.select([String.to_atom(vid)])
-      |> Dux.mutate_with(component: ~s("#{vid}"))
+      |> Dux.mutate_with(component: ~s(#{qi(vid)}))
       |> Dux.compute()
 
     # Iterate: propagate minimum label through neighbors (bidirectional)
@@ -356,23 +356,23 @@ defmodule Dux.Graph do
           WITH
             edges AS (#{edges_sql}),
             bidir_edges AS (
-              SELECT "#{src}" AS a, "#{dst}" AS b FROM edges
+              SELECT #{qi(src)} AS a, #{qi(dst)} AS b FROM edges
               UNION
-              SELECT "#{dst}" AS a, "#{src}" AS b FROM edges
+              SELECT #{qi(dst)} AS a, #{qi(src)} AS b FROM edges
             ),
             neighbor_labels AS (
-              SELECT be.b AS "#{vid}", l.component
+              SELECT be.b AS #{qi(vid)}, l.component
               FROM bidir_edges be
-              JOIN "#{labels_table}" l ON be.a = l."#{vid}"
+              JOIN "#{labels_table}" l ON be.a = l.#{qi(vid)}
             ),
             all_labels AS (
-              SELECT "#{vid}", component FROM "#{labels_table}"
+              SELECT #{qi(vid)}, component FROM "#{labels_table}"
               UNION ALL
-              SELECT "#{vid}", component FROM neighbor_labels
+              SELECT #{qi(vid)}, component FROM neighbor_labels
             )
-          SELECT "#{vid}", MIN(component) AS component
+          SELECT #{qi(vid)}, MIN(component) AS component
           FROM all_labels
-          GROUP BY "#{vid}"
+          GROUP BY #{qi(vid)}
         """
 
         new_labels = Dux.from_query(sql) |> Dux.compute()
@@ -428,18 +428,18 @@ defmodule Dux.Graph do
     WITH edges_cte AS (#{edges_sql})
     SELECT COUNT(*) AS cnt FROM (
       SELECT DISTINCT
-        LEAST(e1."#{src}", e1."#{dst}", e2."#{dst}") AS a,
+        LEAST(e1.#{qi(src)}, e1.#{qi(dst)}, e2.#{qi(dst)}) AS a,
         LEAST(
-          GREATEST(e1."#{src}", e1."#{dst}"),
-          GREATEST(e1."#{src}", e2."#{dst}"),
-          GREATEST(e1."#{dst}", e2."#{dst}")
+          GREATEST(e1.#{qi(src)}, e1.#{qi(dst)}),
+          GREATEST(e1.#{qi(src)}, e2.#{qi(dst)}),
+          GREATEST(e1.#{qi(dst)}, e2.#{qi(dst)})
         ) AS b,
-        GREATEST(e1."#{src}", e1."#{dst}", e2."#{dst}") AS c
+        GREATEST(e1.#{qi(src)}, e1.#{qi(dst)}, e2.#{qi(dst)}) AS c
       FROM edges_cte e1
-      JOIN edges_cte e2 ON e1."#{dst}" = e2."#{src}"
-      JOIN edges_cte e3 ON e2."#{dst}" = e3."#{src}" AND e3."#{dst}" = e1."#{src}"
-      WHERE e1."#{src}" < e1."#{dst}"
-        AND e1."#{dst}" < e2."#{dst}"
+      JOIN edges_cte e2 ON e1.#{qi(dst)} = e2.#{qi(src)}
+      JOIN edges_cte e3 ON e2.#{qi(dst)} = e3.#{qi(src)} AND e3.#{qi(dst)} = e1.#{qi(src)}
+      WHERE e1.#{qi(src)} < e1.#{qi(dst)}
+        AND e1.#{qi(dst)} < e2.#{qi(dst)}
     ) triangles
     """
 
@@ -463,5 +463,11 @@ defmodule Dux.Graph do
   """
   def edge_count(%__MODULE__{} = graph) do
     Dux.n_rows(graph.edges)
+  end
+
+  # Escape double quotes in SQL identifiers to prevent injection
+  defp qi(name) do
+    escaped = String.replace(name, ~s("), ~s(""))
+    ~s("#{escaped}")
   end
 end

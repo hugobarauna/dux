@@ -264,7 +264,10 @@ defmodule Dux.QueryBuilder do
     "SELECT #{cols}"
   end
 
-  defp quote_ident(name), do: ~s("#{name}")
+  defp quote_ident(name) do
+    escaped = String.replace(name, ~s("), ~s(""))
+    ~s("#{escaped}")
+  end
 
   defp join_type_sql(:inner), do: "INNER JOIN"
   defp join_type_sql(:left), do: "LEFT JOIN"
@@ -290,7 +293,7 @@ defmodule Dux.QueryBuilder do
   defp csv_read_options(opts) do
     parts =
       Enum.flat_map(opts, fn
-        {:delimiter, d} -> ["delim = '#{d}'"]
+        {:delimiter, d} -> ["delim = '#{escape_sql_string(d)}'"]
         {:header, true} -> ["header = true"]
         {:header, false} -> ["header = false"]
         {:skip, n} -> ["skip = #{n}"]

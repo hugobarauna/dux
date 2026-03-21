@@ -154,6 +154,7 @@ defmodule Dux.Query.Compiler do
   # --- Helpers ---
 
   defp quote_ident(name) do
-    ~s("#{name}")
+    escaped = String.replace(name, ~s("), ~s(""))
+    ~s("#{escaped}")
   end
 end
