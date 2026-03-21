@@ -1,0 +1,25 @@
+# Build artifacts
+/_build/
+/cover/
+/deps/
+/doc/
+/tmp/
+erl_crash.dump
+*.ez
+dux-*.tar
+
+# Rust build artifacts
+/native/dux/target/
+*.so
+*.dylib
+
+# Private internal repo (separate git)
+/internal/
+
+# Agent config
+/.claude/
+/AGENTS.md
+
+# Editor / OS
+.DS_Store
+.elixir_ls/

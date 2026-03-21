@@ -1,0 +1,16 @@
+[package]
+name = "dux"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dux"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.36"
+duckdb = { version = "1.2", features = ["bundled", "vtab-arrow", "appender-arrow"] }
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+thiserror = "2"
+chrono = "0.4"
