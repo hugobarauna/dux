@@ -4,8 +4,6 @@ defmodule Dux.MixProject do
   @version "0.1.0"
   @source_url "https://github.com/elixir-dux/dux"
 
-  @force_build? System.get_env("DUX_BUILD") in ["1", "true"]
-  @dev? Mix.env() in [:dev, :test]
 
   def project do
     [
@@ -38,7 +36,7 @@ defmodule Dux.MixProject do
   defp deps do
     [
       {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37.3", optional: not (@dev? or @force_build?)},
+      {:rustler, "~> 0.37.3", optional: true},
       {:nx, "~> 0.9", optional: true},
       {:benchee, "~> 1.3", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

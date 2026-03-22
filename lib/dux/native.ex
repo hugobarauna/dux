@@ -17,7 +17,9 @@ defmodule Dux.Native do
       x86_64-pc-windows-msvc
     ),
     nif_versions: ["2.16"],
-    force_build: System.get_env("DUX_BUILD") in ["1", "true"]
+    force_build:
+      System.get_env("DUX_BUILD") in ["1", "true"] or
+        Mix.env() in [:dev, :test]
 
   # Database lifecycle
   def db_open, do: :erlang.nif_error(:nif_not_loaded)
