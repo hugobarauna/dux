@@ -267,40 +267,48 @@ defmodule Dux.Remote.Coordinator do
       {:table, right_ref} = right_computed.source
       right_ipc = Dux.Native.table_to_ipc(right_ref)
 
-      if byte_size(right_ipc) <= threshold do
-        # Small → broadcast
-        broadcast_name = "__bcast_#{:erlang.unique_integer([:positive])}"
-
-        :telemetry.span(
-          [:dux, :distributed, :broadcast],
-          %{table_name: broadcast_name, n_workers: length(workers), ipc_bytes: byte_size(right_ipc)},
-          fn ->
-            broadcast_to_workers(workers, broadcast_name, right_ipc, timeout)
-            {:ok, %{table_name: broadcast_name, n_workers: length(workers), ipc_bytes: byte_size(right_ipc)}}
-          end
-        )
-        broadcast_right = Dux.from_query("SELECT * FROM #{qi(broadcast_name)}")
-        new_op = {:join, broadcast_right, how, on_cols, suffix}
-
-        do_preprocess(
-          rest,
-          [new_op | processed],
-          [broadcast_name | broadcast_names],
-          workers,
-          timeout,
-          threshold
-        )
-      else
-        # Large → shuffle. Split the pipeline here.
-        {:shuffle, Enum.reverse(processed), {right_computed, how, on_cols, suffix}, rest,
-         broadcast_names}
-      end
+      route_non_safe_join(%{
+        right_ipc: right_ipc, right_computed: right_computed,
+        how: how, on_cols: on_cols, suffix: suffix,
+        rest: rest, processed: processed, broadcast_names: broadcast_names,
+        workers: workers, timeout: timeout, threshold: threshold
+      })
     end
   end
 
   # Non-join op: pass through
   defp do_preprocess([op | rest], processed, broadcast_names, workers, timeout, threshold) do
     do_preprocess(rest, [op | processed], broadcast_names, workers, timeout, threshold)
+  end
+
+  defp route_non_safe_join(%{right_ipc: right_ipc, threshold: threshold} = ctx) do
+    if byte_size(right_ipc) <= threshold do
+      broadcast_name = "__bcast_#{:erlang.unique_integer([:positive])}"
+      do_broadcast(ctx.workers, broadcast_name, right_ipc, ctx.timeout)
+      broadcast_right = Dux.from_query("SELECT * FROM #{qi(broadcast_name)}")
+      new_op = {:join, broadcast_right, ctx.how, ctx.on_cols, ctx.suffix}
+
+      do_preprocess(
+        ctx.rest,
+        [new_op | ctx.processed],
+        [broadcast_name | ctx.broadcast_names],
+        ctx.workers,
+        ctx.timeout,
+        threshold
+      )
+    else
+      {:shuffle, Enum.reverse(ctx.processed),
+       {ctx.right_computed, ctx.how, ctx.on_cols, ctx.suffix}, ctx.rest, ctx.broadcast_names}
+    end
+  end
+
+  defp do_broadcast(workers, name, ipc, timeout) do
+    meta = %{table_name: name, n_workers: length(workers), ipc_bytes: byte_size(ipc)}
+
+    :telemetry.span([:dux, :distributed, :broadcast], meta, fn ->
+      broadcast_to_workers(workers, name, ipc, timeout)
+      {:ok, meta}
+    end)
   end
 
   defp broadcast_to_workers(workers, name, ipc_binary, _timeout) do

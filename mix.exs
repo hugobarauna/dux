@@ -37,6 +37,7 @@ defmodule Dux.MixProject do
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37.3", optional: true},
       {:telemetry, "~> 1.0"},
+      {:flame, "~> 0.5", optional: true},
       {:nx, "~> 0.9", optional: true},
       {:benchee, "~> 1.3", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

@@ -36,7 +36,7 @@ defmodule Dux.Remote.Shuffle do
     * `:timeout` — per-operation timeout (default: `:infinity`)
   """
   def execute(%Dux{} = left, %Dux{} = right, opts) do
-    workers = Keyword.get_lazy(opts, :workers, &Dux.Remote.Worker.list/0)
+    workers = Keyword.get_lazy(opts, :workers, &Worker.list/0)
     n_workers = length(workers)
     n_buckets = n_workers * @over_partition_factor
 
