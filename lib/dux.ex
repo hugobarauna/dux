@@ -724,38 +724,48 @@ defmodule Dux do
   end
 
   def compute(%Dux{workers: workers} = dux, opts) when is_list(workers) and workers != [] do
-    coordinator_opts = [workers: workers] ++ Keyword.take(opts, [:broadcast_threshold])
-    # credo:disable-for-next-line Credo.Check.Design.AliasUsage
-    result = Dux.Remote.Coordinator.execute(dux, coordinator_opts)
-    %{result | workers: workers}
+    meta = %{n_ops: length(dux.ops), distributed: true}
+
+    :telemetry.span([:dux, :query], meta, fn ->
+      coordinator_opts = [workers: workers] ++ Keyword.take(opts, [:broadcast_threshold])
+      # credo:disable-for-next-line Credo.Check.Design.AliasUsage
+      result = Dux.Remote.Coordinator.execute(dux, coordinator_opts)
+      result = %{result | workers: workers}
+      {:table, ref} = result.source
+      {result, Map.put(meta, :n_rows, Dux.Native.table_n_rows(ref))}
+    end)
   end
 
   def compute(%Dux{} = dux, _opts) do
-    # Local execution
-    db = Dux.Connection.get_db()
+    meta = %{n_ops: length(dux.ops), distributed: false}
 
-    source_ref = extract_source_ref(dux)
-    Process.put(:dux_compute_ref, source_ref)
+    :telemetry.span([:dux, :query], meta, fn ->
+      db = Dux.Connection.get_db()
 
-    {sql, source_setup} = Dux.QueryBuilder.build(dux, db)
+      source_ref = extract_source_ref(dux)
+      Process.put(:dux_compute_ref, source_ref)
 
-    Enum.each(source_setup, fn setup_sql ->
-      Dux.Native.db_execute(db, setup_sql)
+      {sql, source_setup} = Dux.QueryBuilder.build(dux, db)
+
+      Enum.each(source_setup, fn setup_sql ->
+        Dux.Native.db_execute(db, setup_sql)
+      end)
+
+      result =
+        case Dux.Native.df_query(db, sql) do
+          {:error, reason} ->
+            raise ArgumentError, "DuckDB query failed: #{reason}"
+
+          table_ref ->
+            names = Dux.Native.table_names(table_ref)
+            dtypes = table_ref |> Dux.Native.table_dtypes() |> Map.new()
+            %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes}
+        end
+
+      Process.delete(:dux_compute_ref)
+      {:table, ref} = result.source
+      {result, Map.put(meta, :n_rows, Dux.Native.table_n_rows(ref))}
     end)
-
-    result =
-      case Dux.Native.df_query(db, sql) do
-        {:error, reason} ->
-          raise ArgumentError, "DuckDB query failed: #{reason}"
-
-        table_ref ->
-          names = Dux.Native.table_names(table_ref)
-          dtypes = table_ref |> Dux.Native.table_dtypes() |> Map.new()
-          %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes}
-      end
-
-    Process.delete(:dux_compute_ref)
-    result
   end
 
   @doc """
@@ -1133,26 +1143,31 @@ defmodule Dux do
   defp encode_param(nil), do: "NULL"
 
   defp write_copy(%Dux{} = dux, path, format, opts) do
-    db = Dux.Connection.get_db()
-    Process.put(:dux_write_ref, extract_source_ref(dux))
-    {query_sql, source_setup} = Dux.QueryBuilder.build(dux, db)
+    fmt_atom = format |> String.downcase() |> String.to_atom()
+    meta = %{format: fmt_atom, path: path}
 
-    Enum.each(source_setup, fn setup_sql ->
-      Dux.Native.db_execute(db, setup_sql)
+    :telemetry.span([:dux, :io, :write], meta, fn ->
+      db = Dux.Connection.get_db()
+      Process.put(:dux_write_ref, extract_source_ref(dux))
+      {query_sql, source_setup} = Dux.QueryBuilder.build(dux, db)
+
+      Enum.each(source_setup, fn setup_sql ->
+        Dux.Native.db_execute(db, setup_sql)
+      end)
+
+      copy_opts = build_copy_options(format, opts)
+      escaped_path = String.replace(path, "'", "''")
+      sql = "COPY (#{query_sql}) TO '#{escaped_path}' (#{copy_opts})"
+
+      result =
+        case Dux.Native.db_execute(db, sql) do
+          {} -> :ok
+          {:error, reason} -> raise ArgumentError, "DuckDB write failed: #{reason}"
+        end
+
+      Process.delete(:dux_write_ref)
+      {result, meta}
     end)
-
-    copy_opts = build_copy_options(format, opts)
-    escaped_path = String.replace(path, "'", "''")
-    sql = "COPY (#{query_sql}) TO '#{escaped_path}' (#{copy_opts})"
-
-    result =
-      case Dux.Native.db_execute(db, sql) do
-        {} -> :ok
-        {:error, reason} -> raise ArgumentError, "DuckDB write failed: #{reason}"
-      end
-
-    Process.delete(:dux_write_ref)
-    result
   end
 
   defp build_copy_options("CSV", opts) do

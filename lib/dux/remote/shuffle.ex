@@ -36,7 +36,18 @@ defmodule Dux.Remote.Shuffle do
     * `:timeout` — per-operation timeout (default: `:infinity`)
   """
   def execute(%Dux{} = left, %Dux{} = right, opts) do
-    execute_with_retry(left, right, opts, 0)
+    workers = Keyword.get_lazy(opts, :workers, &Dux.Remote.Worker.list/0)
+    n_workers = length(workers)
+    n_buckets = n_workers * @over_partition_factor
+
+    :telemetry.span(
+      [:dux, :distributed, :shuffle],
+      %{n_workers: n_workers, n_buckets: n_buckets},
+      fn ->
+        result = execute_with_retry(left, right, opts, 0)
+        {result, %{n_workers: n_workers, n_buckets: n_buckets}}
+      end
+    )
   end
 
   defp execute_with_retry(left, right, opts, attempt) do

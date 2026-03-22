@@ -110,7 +110,14 @@ defmodule Dux.Remote.Coordinator do
   # Standard distributed execution: partition → fan out → merge
   defp execute_fan_out(worker_pipeline, workers, strategy, timeout) do
     assignments = Partitioner.assign(worker_pipeline, workers, strategy: strategy)
-    results = fan_out(assignments, timeout)
+    n_workers = length(assignments)
+
+    results =
+      :telemetry.span([:dux, :distributed, :fan_out], %{n_workers: n_workers}, fn ->
+        r = fan_out(assignments, timeout)
+        {r, %{n_workers: n_workers}}
+      end)
+
     {successes, failures} = partition_results(results)
 
     if successes == [] do
@@ -118,7 +125,10 @@ defmodule Dux.Remote.Coordinator do
       raise ArgumentError, "all workers failed: #{inspect(reasons)}"
     end
 
-    Merger.merge_to_dux(successes, worker_pipeline)
+    :telemetry.span([:dux, :distributed, :merge], %{n_results: length(successes)}, fn ->
+      merged = Merger.merge_to_dux(successes, worker_pipeline)
+      {merged, %{n_results: length(successes)}}
+    end)
   end
 
   # Multi-stage execution for shuffle joins:
@@ -174,14 +184,30 @@ defmodule Dux.Remote.Coordinator do
   end
 
   defp fan_out(assignments, timeout) do
-    # Execute in parallel via Task.async_stream
+    n_workers = length(assignments)
+
     assignments
+    |> Enum.with_index()
     |> Task.async_stream(
-      fn {worker, partition_pipeline} ->
-        Worker.execute(worker, partition_pipeline, timeout)
+      fn {{worker, partition_pipeline}, idx} ->
+        start_time = System.monotonic_time()
+        result = Worker.execute(worker, partition_pipeline, timeout)
+
+        case result do
+          {:ok, ipc} ->
+            :telemetry.execute([:dux, :distributed, :worker, :stop], %{
+              duration: System.monotonic_time() - start_time,
+              ipc_bytes: byte_size(ipc)
+            }, %{worker: worker, worker_index: idx, n_workers: n_workers})
+
+          _ ->
+            :ok
+        end
+
+        result
       end,
       timeout: timeout,
-      max_concurrency: length(assignments),
+      max_concurrency: n_workers,
       ordered: true
     )
     |> Enum.map(fn
@@ -244,7 +270,15 @@ defmodule Dux.Remote.Coordinator do
       if byte_size(right_ipc) <= threshold do
         # Small → broadcast
         broadcast_name = "__bcast_#{:erlang.unique_integer([:positive])}"
-        broadcast_to_workers(workers, broadcast_name, right_ipc, timeout)
+
+        :telemetry.span(
+          [:dux, :distributed, :broadcast],
+          %{table_name: broadcast_name, n_workers: length(workers), ipc_bytes: byte_size(right_ipc)},
+          fn ->
+            broadcast_to_workers(workers, broadcast_name, right_ipc, timeout)
+            {:ok, %{table_name: broadcast_name, n_workers: length(workers), ipc_bytes: byte_size(right_ipc)}}
+          end
+        )
         broadcast_right = Dux.from_query("SELECT * FROM #{qi(broadcast_name)}")
         new_op = {:join, broadcast_right, how, on_cols, suffix}
 

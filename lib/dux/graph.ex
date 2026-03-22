@@ -212,11 +212,23 @@ defmodule Dux.Graph do
     iterations = Keyword.get(opts, :iterations, 20)
     workers = graph.workers
 
-    if workers do
-      pagerank_distributed(graph, damping, iterations, workers)
-    else
-      pagerank_local(graph, damping, iterations)
-    end
+    meta = %{
+      algorithm: :pagerank,
+      n_vertices: vertex_count(graph),
+      n_edges: edge_count(graph),
+      distributed: workers != nil
+    }
+
+    :telemetry.span([:dux, :graph, :algorithm], meta, fn ->
+      result =
+        if workers do
+          pagerank_distributed(graph, damping, iterations, workers)
+        else
+          pagerank_local(graph, damping, iterations)
+        end
+
+      {result, meta}
+    end)
   end
 
   defp pagerank_local(graph, damping, iterations) do
@@ -408,11 +420,23 @@ defmodule Dux.Graph do
     workers = graph.workers
     max_depth = Keyword.get(opts, :max_depth, 1000)
 
-    if workers do
-      shortest_paths_distributed(graph, from_vertex, max_depth, workers)
-    else
-      shortest_paths_local(graph, from_vertex, max_depth)
-    end
+    meta = %{
+      algorithm: :shortest_paths,
+      n_vertices: vertex_count(graph),
+      n_edges: edge_count(graph),
+      distributed: workers != nil
+    }
+
+    :telemetry.span([:dux, :graph, :algorithm], meta, fn ->
+      result =
+        if workers do
+          shortest_paths_distributed(graph, from_vertex, max_depth, workers)
+        else
+          shortest_paths_local(graph, from_vertex, max_depth)
+        end
+
+      {result, meta}
+    end)
   end
 
   defp shortest_paths_local(graph, from_vertex, max_depth) do
@@ -513,11 +537,23 @@ defmodule Dux.Graph do
     max_iterations = Keyword.get(opts, :max_iterations, 100)
     workers = graph.workers
 
-    if workers do
-      cc_distributed(graph, max_iterations, workers)
-    else
-      cc_local(graph, max_iterations)
-    end
+    meta = %{
+      algorithm: :connected_components,
+      n_vertices: vertex_count(graph),
+      n_edges: edge_count(graph),
+      distributed: workers != nil
+    }
+
+    :telemetry.span([:dux, :graph, :algorithm], meta, fn ->
+      result =
+        if workers do
+          cc_distributed(graph, max_iterations, workers)
+        else
+          cc_local(graph, max_iterations)
+        end
+
+      {result, meta}
+    end)
   end
 
   defp cc_local(graph, max_iterations) do
@@ -755,11 +791,23 @@ defmodule Dux.Graph do
   def triangle_count(%__MODULE__{} = graph) do
     workers = graph.workers
 
-    if workers do
-      triangle_count_distributed(graph, workers)
-    else
-      triangle_count_local(graph)
-    end
+    meta = %{
+      algorithm: :triangle_count,
+      n_vertices: vertex_count(graph),
+      n_edges: edge_count(graph),
+      distributed: workers != nil
+    }
+
+    :telemetry.span([:dux, :graph, :algorithm], meta, fn ->
+      result =
+        if workers do
+          triangle_count_distributed(graph, workers)
+        else
+          triangle_count_local(graph)
+        end
+
+      {result, meta}
+    end)
   end
 
   defp triangle_count_local(graph) do
