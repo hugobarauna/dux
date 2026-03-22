@@ -62,7 +62,7 @@ defmodule Dux.Remote.Coordinator do
         try do
           result = execute_fan_out(worker_pipeline, workers, strategy, timeout)
           result = apply_avg_rewrites(result, rewrites)
-          apply_coordinator_ops(result, coord_ops)
+          finalize(result, coord_ops)
         after
           cleanup_broadcast_tables(workers, broadcast_tables)
         end
@@ -70,10 +70,20 @@ defmodule Dux.Remote.Coordinator do
       {:shuffle, ops_before, {right_computed, how, on_cols, suffix}, ops_after, broadcast_tables} ->
         # Pipeline needs a shuffle stage: execute pre-join → shuffle → post-join
         try do
-          execute_with_shuffle(
-            pipeline, ops_before, right_computed, how, on_cols, suffix,
-            ops_after, coord_ops, rewrites, workers, strategy, timeout
-          )
+          execute_with_shuffle(%{
+            pipeline: pipeline,
+            ops_before: ops_before,
+            right: right_computed,
+            how: how,
+            on_cols: on_cols,
+            suffix: suffix,
+            ops_after: ops_after,
+            coord_ops: coord_ops,
+            rewrites: rewrites,
+            workers: workers,
+            strategy: strategy,
+            timeout: timeout
+          })
         after
           cleanup_broadcast_tables(workers, broadcast_tables)
         end
@@ -115,22 +125,28 @@ defmodule Dux.Remote.Coordinator do
   # 1. Execute ops before the join as a distributed query
   # 2. Shuffle join the result with the right side
   # 3. Apply remaining ops + coordinator ops
-  defp execute_with_shuffle(
-         pipeline, ops_before, right_computed, how, on_cols, _suffix,
-         ops_after, coord_ops, rewrites, workers, strategy, timeout
-       ) do
+  defp execute_with_shuffle(%{
+         pipeline: pipeline,
+         ops_before: ops_before,
+         right: right_computed,
+         how: how,
+         on_cols: on_cols,
+         ops_after: ops_after,
+         coord_ops: coord_ops,
+         rewrites: rewrites,
+         workers: workers,
+         strategy: strategy,
+         timeout: timeout
+       }) do
     # Stage 1: execute pre-join ops distributed
     left_result =
       if ops_before == [] do
-        # No ops before join — just compute the source
         Dux.compute(%{pipeline | ops: []})
       else
-        pre_pipeline = %{pipeline | ops: ops_before}
-        execute_fan_out(pre_pipeline, workers, strategy, timeout)
+        execute_fan_out(%{pipeline | ops: ops_before}, workers, strategy, timeout)
       end
 
     # Stage 2: shuffle join
-    # Convert on_cols [{left, right}, ...] to the format Shuffle expects
     shuffle_on =
       case on_cols do
         [{col, col}] -> String.to_atom(col)
@@ -146,17 +162,15 @@ defmodule Dux.Remote.Coordinator do
       )
 
     # Stage 3: apply remaining ops + rewrites + coordinator ops
-    # Any ops after the join in the worker list need to run on the shuffle result
     result =
       if ops_after == [] do
         shuffle_result
       else
-        post_pipeline = %{shuffle_result | ops: ops_after}
-        Dux.compute(post_pipeline)
+        Dux.compute(%{shuffle_result | ops: ops_after})
       end
 
     result = apply_avg_rewrites(result, rewrites)
-    apply_coordinator_ops(result, coord_ops)
+    finalize(result, coord_ops)
   end
 
   defp fan_out(assignments, timeout) do
@@ -244,8 +258,8 @@ defmodule Dux.Remote.Coordinator do
         )
       else
         # Large → shuffle. Split the pipeline here.
-        {:shuffle, Enum.reverse(processed),
-         {right_computed, how, on_cols, suffix}, rest, broadcast_names}
+        {:shuffle, Enum.reverse(processed), {right_computed, how, on_cols, suffix}, rest,
+         broadcast_names}
       end
     end
   end
@@ -365,18 +379,18 @@ defmodule Dux.Remote.Coordinator do
     end
   end
 
-  # Apply coordinator-only ops to the merged result and compute locally.
-  # The result must be fully materialized — if we return a %Dux{} with pending ops
-  # and workers still set, compute() would re-distribute those ops.
-  defp apply_coordinator_ops(dux, []), do: dux
-
-  defp apply_coordinator_ops(dux, coord_ops) do
+  # Finalize the Coordinator result: apply coordinator-only ops and compute
+  # locally. The result must be fully materialized — if we return a %Dux{}
+  # with pending ops and workers still set, compute() would re-distribute them.
+  defp finalize(dux, coord_ops) do
     pipeline = Enum.reduce(coord_ops, dux, &apply_single_op(&2, &1))
 
-    # Compute locally to materialize the result — strip workers to prevent
-    # re-distribution of coordinator-only ops
-    local = %{pipeline | workers: nil}
-    Dux.compute(local)
+    if pipeline.ops == [] do
+      pipeline
+    else
+      local = %{pipeline | workers: nil}
+      Dux.compute(local)
+    end
   end
 
   defp apply_single_op(dux, {:slice, offset, length}), do: Dux.slice(dux, offset, length)
@@ -396,5 +410,4 @@ defmodule Dux.Remote.Coordinator do
     # Unknown op — append directly
     %{dux | ops: dux.ops ++ [op]}
   end
-
 end
