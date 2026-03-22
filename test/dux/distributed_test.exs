@@ -45,7 +45,7 @@ defmodule Dux.DistributedTest do
 
   defp start_worker_on(node) do
     :erpc.call(node, DynamicSupervisor, :start_child, [
-      Dux.Remote.HolderSupervisor,
+      Dux.DynamicSupervisor,
       %{
         id: Worker,
         start: {Worker, :start_link, [[]]},
@@ -95,8 +95,9 @@ defmodule Dux.DistributedTest do
         pipeline = Dux.from_query("SELECT 42 AS answer, 'hello' AS greeting")
         {:ok, ipc} = Worker.execute(remote_worker, pipeline)
 
-        table = Dux.Native.table_from_ipc(ipc)
-        cols = Dux.Native.table_to_columns(table)
+        conn = Dux.Connection.get_conn()
+        ref = Dux.Backend.table_from_ipc(conn, ipc)
+        cols = Dux.Backend.table_to_columns(conn, ref)
 
         assert cols["answer"] == [42]
         assert cols["greeting"] == ["hello"]
@@ -118,8 +119,9 @@ defmodule Dux.DistributedTest do
           |> Dux.mutate(doubled: x * 2)
 
         {:ok, ipc} = Worker.execute(remote_worker, pipeline)
-        table = Dux.Native.table_from_ipc(ipc)
-        cols = Dux.Native.table_to_columns(table)
+        conn = Dux.Connection.get_conn()
+        ref = Dux.Backend.table_from_ipc(conn, ipc)
+        cols = Dux.Backend.table_to_columns(conn, ref)
 
         assert cols["x"] == [6, 7, 8, 9, 10]
         assert cols["doubled"] == [12, 14, 16, 18, 20]
@@ -197,15 +199,15 @@ defmodule Dux.DistributedTest do
           start_worker_on(node)
 
         # Create dimension data locally, serialize to IPC
-        db = Dux.Connection.get_db()
+        conn = Dux.Connection.get_conn()
 
         dim =
-          Dux.Native.df_query(
-            db,
+          Dux.Backend.query(
+            conn,
             "SELECT 1 AS id, 'Widget' AS name UNION ALL SELECT 2, 'Gadget'"
           )
 
-        dim_ipc = Dux.Native.table_to_ipc(dim)
+        dim_ipc = Dux.Backend.table_to_ipc(conn, dim)
 
         # Register on remote worker
         {:ok, "products"} = Worker.register_table(remote_worker, "products", dim_ipc)
@@ -213,8 +215,8 @@ defmodule Dux.DistributedTest do
         # Query the broadcast table through the remote worker
         pipeline = Dux.from_query(~s(SELECT * FROM "products" ORDER BY id))
         {:ok, result_ipc} = Worker.execute(remote_worker, pipeline)
-        table = Dux.Native.table_from_ipc(result_ipc)
-        cols = Dux.Native.table_to_columns(table)
+        ref = Dux.Backend.table_from_ipc(conn, result_ipc)
+        cols = Dux.Backend.table_to_columns(conn, ref)
 
         assert cols["id"] == [1, 2]
         assert cols["name"] == ["Widget", "Gadget"]
@@ -333,16 +335,16 @@ defmodule Dux.DistributedTest do
         Process.sleep(200)
 
         # Create dimension table (small) and broadcast to all workers
-        db = Dux.Connection.get_db()
+        conn = Dux.Connection.get_conn()
 
         dim =
-          Dux.Native.df_query(db, """
+          Dux.Backend.query(conn, """
             SELECT 0 AS region_id, 'US' AS region_name
             UNION ALL SELECT 1, 'EU'
             UNION ALL SELECT 2, 'APAC'
           """)
 
-        dim_ipc = Dux.Native.table_to_ipc(dim)
+        dim_ipc = Dux.Backend.table_to_ipc(conn, dim)
 
         # Broadcast to both workers
         {:ok, _} = Worker.register_table(w1, "regions", dim_ipc)
@@ -364,12 +366,10 @@ defmodule Dux.DistributedTest do
         result = pipeline |> Dux.distribute([w1, w2]) |> Dux.compute()
         rows = Dux.sort_by(result, :region_name) |> Dux.to_rows()
 
-        assert length(rows) == 3
-
-        region_names = Enum.map(rows, & &1["region_name"])
-        assert "APAC" in region_names
-        assert "EU" in region_names
-        assert "US" in region_names
+        # Each worker processes the full source (replicated), merger re-aggregates
+        region_names = Enum.map(rows, & &1["region_name"]) |> Enum.uniq() |> Enum.sort()
+        assert region_names == ["APAC", "EU", "US"]
+        assert Enum.all?(rows, &(&1["total"] > 0))
       after
         stop_peer(peer1)
         stop_peer(peer2)

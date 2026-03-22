@@ -15,7 +15,11 @@ defmodule Dux.DistributedGraphTest do
     pid
   end
 
-  defp stop(w), do: if(Process.alive?(w), do: GenServer.stop(w))
+  defp stop(w) do
+    GenServer.stop(w)
+  catch
+    :exit, _ -> :ok
+  end
 
   defp triangle_graph do
     vertices = Dux.from_list([%{id: 1}, %{id: 2}, %{id: 3}])
@@ -342,7 +346,7 @@ defmodule Dux.DistributedGraphTest do
 
     defp start_worker_on(node) do
       :erpc.call(node, DynamicSupervisor, :start_child, [
-        Dux.Remote.HolderSupervisor,
+        Dux.DynamicSupervisor,
         %{id: Worker, start: {Worker, :start_link, [[]]}, restart: :temporary}
       ])
     end

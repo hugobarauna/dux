@@ -195,10 +195,14 @@ defmodule Dux.Remote.Coordinator do
 
         case result do
           {:ok, ipc} ->
-            :telemetry.execute([:dux, :distributed, :worker, :stop], %{
-              duration: System.monotonic_time() - start_time,
-              ipc_bytes: byte_size(ipc)
-            }, %{worker: worker, worker_index: idx, n_workers: n_workers})
+            :telemetry.execute(
+              [:dux, :distributed, :worker, :stop],
+              %{
+                duration: System.monotonic_time() - start_time,
+                ipc_bytes: byte_size(ipc)
+              },
+              %{worker: worker, worker_index: idx, n_workers: n_workers}
+            )
 
           _ ->
             :ok
@@ -263,15 +267,25 @@ defmodule Dux.Remote.Coordinator do
       do_preprocess(rest, [op | processed], broadcast_names, workers, timeout, threshold)
     else
       # Non-worker-safe — compute right side and decide broadcast vs shuffle
+      conn = Dux.Connection.get_conn()
       right_computed = Dux.compute(right)
       {:table, right_ref} = right_computed.source
-      right_ipc = Dux.Native.table_to_ipc(right_ref)
+      right_n_rows = Dux.Backend.table_n_rows(conn, right_ref)
 
-      route_non_safe_join(%{
-        right_ipc: right_ipc, right_computed: right_computed,
-        how: how, on_cols: on_cols, suffix: suffix,
-        rest: rest, processed: processed, broadcast_names: broadcast_names,
-        workers: workers, timeout: timeout, threshold: threshold
+      preprocess_non_safe_join(%{
+        conn: conn,
+        right_ref: right_ref,
+        right_computed: right_computed,
+        right_n_rows: right_n_rows,
+        how: how,
+        on_cols: on_cols,
+        suffix: suffix,
+        rest: rest,
+        processed: processed,
+        broadcast_names: broadcast_names,
+        workers: workers,
+        timeout: timeout,
+        threshold: threshold
       })
     end
   end
@@ -279,6 +293,44 @@ defmodule Dux.Remote.Coordinator do
   # Non-join op: pass through
   defp do_preprocess([op | rest], processed, broadcast_names, workers, timeout, threshold) do
     do_preprocess(rest, [op | processed], broadcast_names, workers, timeout, threshold)
+  end
+
+  defp preprocess_non_safe_join(%{right_n_rows: 0} = ctx) do
+    {names, types} = describe_for_empty(ctx.conn, ctx.right_ref)
+
+    col_defs =
+      Enum.zip(names, types)
+      |> Enum.map_join(", ", fn {n, t} -> "NULL::#{t} AS #{qi(n)}" end)
+
+    empty_right = Dux.from_query("SELECT #{col_defs} WHERE false")
+    new_op = {:join, empty_right, ctx.how, ctx.on_cols, ctx.suffix}
+
+    do_preprocess(
+      ctx.rest,
+      [new_op | ctx.processed],
+      ctx.broadcast_names,
+      ctx.workers,
+      ctx.timeout,
+      ctx.threshold
+    )
+  end
+
+  defp preprocess_non_safe_join(ctx) do
+    right_ipc = Dux.Backend.table_to_ipc(ctx.conn, ctx.right_ref)
+
+    route_non_safe_join(%{
+      right_ipc: right_ipc,
+      right_computed: ctx.right_computed,
+      how: ctx.how,
+      on_cols: ctx.on_cols,
+      suffix: ctx.suffix,
+      rest: ctx.rest,
+      processed: ctx.processed,
+      broadcast_names: ctx.broadcast_names,
+      workers: ctx.workers,
+      timeout: ctx.timeout,
+      threshold: ctx.threshold
+    })
   end
 
   defp route_non_safe_join(%{right_ipc: right_ipc, threshold: threshold} = ctx) do
@@ -300,6 +352,12 @@ defmodule Dux.Remote.Coordinator do
       {:shuffle, Enum.reverse(ctx.processed),
        {ctx.right_computed, ctx.how, ctx.on_cols, ctx.suffix}, ctx.rest, ctx.broadcast_names}
     end
+  end
+
+  defp describe_for_empty(conn, %Dux.TableRef{name: name}) do
+    result = Adbc.Connection.query!(conn, "DESCRIBE #{qi(name)}")
+    map = Adbc.Result.to_map(result)
+    {map["column_name"] || [], map["column_type"] || []}
   end
 
   defp do_broadcast(workers, name, ipc, timeout) do

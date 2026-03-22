@@ -22,6 +22,10 @@ defmodule Dux.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: [check: :test]]
+  end
+
   def application do
     [
       extra_applications: [:logger],
@@ -34,8 +38,7 @@ defmodule Dux.MixProject do
 
   defp deps do
     [
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37.3", optional: true},
+      {:adbc, github: "livebook-dev/adbc"},
       {:telemetry, "~> 1.0"},
       {:flame, "~> 0.5", optional: true},
       {:nx, "~> 0.9", optional: true},
@@ -48,18 +51,14 @@ defmodule Dux.MixProject do
 
   defp package do
     [
-      files:
-        [
-          "lib",
-          "native/dux/src",
-          "native/dux/Cargo.toml",
-          "native/dux/Cargo.lock",
-          "mix.exs",
-          "README.md",
-          "CHANGELOG.md",
-          "LICENSE-APACHE",
-          "LICENSE-MIT"
-        ] ++ checksum_files(),
+      files: [
+        "lib",
+        "mix.exs",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE-APACHE",
+        "LICENSE-MIT"
+      ],
       licenses: ["Apache-2.0", "MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -97,15 +96,15 @@ defmodule Dux.MixProject do
     ]
   end
 
-  # Include checksum files if they exist (generated during release)
-  defp checksum_files do
-    Path.wildcard("checksum-*.exs")
-  end
-
   defp aliases do
     [
-      "rust.lint": ["cmd cargo clippy --manifest-path=native/dux/Cargo.toml -- -Dwarnings"],
-      "rust.fmt": ["cmd cargo fmt --manifest-path=native/dux/Cargo.toml --all"]
+      check: [
+        "format --check-formatted",
+        "deps.compile",
+        "compile --warnings-as-errors",
+        "test --exclude distributed",
+        "credo --strict"
+      ]
     ]
   end
 end

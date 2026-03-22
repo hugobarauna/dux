@@ -20,7 +20,9 @@ defmodule Dux.BroadcastTest do
   end
 
   defp stop_worker(w) do
-    if Process.alive?(w), do: GenServer.stop(w)
+    GenServer.stop(w)
+  catch
+    :exit, _ -> :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -234,7 +236,7 @@ defmodule Dux.BroadcastTest do
 
     defp start_worker_on(node) do
       :erpc.call(node, DynamicSupervisor, :start_child, [
-        Dux.Remote.HolderSupervisor,
+        Dux.DynamicSupervisor,
         %{id: Worker, start: {Worker, :start_link, [[]]}, restart: :temporary}
       ])
     end
