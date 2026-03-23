@@ -2,51 +2,85 @@ defmodule Dux do
   @moduledoc """
   DuckDB-native dataframe library for Elixir.
 
-  The `Dux` module IS the dataframe. All operations are verbs on `%Dux{}` structs.
-  Pipelines are lazy — operations accumulate until `compute/1` compiles them to
-  SQL CTEs and executes against DuckDB.
+  Dux gives you a dataframe API that compiles to SQL and executes on DuckDB.
+  Pipelines are lazy — operations accumulate as an AST until you materialize.
+  DuckDB handles all the heavy lifting: columnar execution, parallel scans,
+  predicate pushdown, and vectorized aggregation.
 
-  `require Dux` to use expression-based verbs like `filter/2`, `mutate/2`,
-  and `summarise/2`. Bare identifiers become column names, `^` interpolates
-  Elixir values as parameter bindings.
+  This module contains the core dataframe verbs. For graph analytics, see
+  `Dux.Graph`. For distributed execution, see `Dux.Remote`. For embedded
+  datasets, see `Dux.Datasets`.
 
-  ## Creating data
+  ## Quick start
 
-      iex> df = Dux.from_list([%{x: 1, y: "a"}, %{x: 2, y: "b"}])
-      iex> Dux.to_rows(df)
-      [%{"x" => 1, "y" => "a"}, %{"x" => 2, "y" => "b"}]
+      require Dux
 
-  ## Piping through verbs
+      Dux.Datasets.penguins()
+      |> Dux.filter(species == "Gentoo" and body_mass_g > 5000)
+      |> Dux.group_by(:island)
+      |> Dux.summarise(count: count(species), avg_mass: avg(body_mass_g))
+      |> Dux.to_rows()
+
+  ## How it works
+
+  1. **Build** — each verb (`filter`, `mutate`, `group_by`, etc.) appends an
+     operation to the `%Dux{}` struct. No computation happens.
+
+  2. **Compile** — when you call `compute/1`, `to_rows/1`, or `to_columns/1`,
+     the operation list compiles to a chain of SQL CTEs.
+
+  3. **Execute** — DuckDB runs the SQL. Results land in a temporary table
+     that's automatically cleaned up when garbage collected.
+
+  Use `sql_preview/1` to see the generated SQL at any point:
 
       iex> require Dux
-      iex> Dux.from_query("SELECT * FROM range(1, 6) t(x)")
-      ...> |> Dux.filter(x > 2)
-      ...> |> Dux.mutate(doubled: x * 2)
-      ...> |> Dux.to_columns()
-      %{"doubled" => [6, 8, 10], "x" => [3, 4, 5]}
+      iex> Dux.from_query("SELECT * FROM range(10) t(x)")
+      ...> |> Dux.filter(x > 5)
+      ...> |> Dux.sql_preview()
+      ...> |> String.contains?("WHERE")
+      true
 
-  ## Interpolation with ^
+  ## Expression syntax
+
+  Verbs like `filter/2`, `mutate/2`, and `summarise/2` are macros that capture
+  Elixir expressions. Bare identifiers become column names. Use `^` to
+  interpolate Elixir values safely (as parameter bindings, not string
+  interpolation):
 
       iex> require Dux
-      iex> min_val = 3
+      iex> threshold = 3
       iex> Dux.from_query("SELECT * FROM range(1, 6) t(x)")
-      ...> |> Dux.filter(x > ^min_val)
+      ...> |> Dux.filter(x > ^threshold)
       ...> |> Dux.to_columns()
       %{"x" => [4, 5]}
 
-  ## Raw SQL strings
-
-  The `_with` variants accept raw SQL strings for programmatic use:
+  Every expression verb has a `_with` variant that accepts raw DuckDB SQL
+  strings for full access to DuckDB's function library:
 
       iex> Dux.from_query("SELECT * FROM range(1, 6) t(x)")
       ...> |> Dux.filter_with("x > 3")
       ...> |> Dux.to_columns()
       %{"x" => [4, 5]}
 
-  ## Lazy by default
+  ## Distribution
 
-  Operations accumulate — nothing hits DuckDB until you call `compute/1`,
-  `to_rows/1`, or `to_columns/1`. This lets DuckDB optimize the full pipeline.
+  Mark a pipeline for distributed execution across BEAM nodes with
+  `distribute/2`. The same verbs work — Dux partitions, fans out, and
+  merges automatically. See `Dux.Remote` for details.
+
+      workers = Dux.Remote.Worker.list()
+
+      Dux.from_parquet("s3://data/**/*.parquet")
+      |> Dux.distribute(workers)
+      |> Dux.group_by(:region)
+      |> Dux.summarise(total: sum(amount))
+      |> Dux.to_rows()
+
+  ## Embedded datasets
+
+  `Dux.Datasets` ships with CC0 datasets for learning and testing:
+  penguins, gapminder, nycflights13 (flights, airlines, airports, planes).
   """
 
   defstruct [:source, :remote, :workers, ops: [], names: [], dtypes: %{}, groups: []]
@@ -70,6 +104,7 @@ defmodule Dux do
   # Constructors
   # ---------------------------------------------------------------------------
 
+  @doc group: :constructors
   @doc """
   Create a Dux from a raw SQL query.
 
@@ -87,6 +122,7 @@ defmodule Dux do
     %Dux{source: {:sql, sql}}
   end
 
+  @doc group: :constructors
   @doc """
   Create a Dux from a list of maps.
 
@@ -104,6 +140,7 @@ defmodule Dux do
   # Distribution
   # ---------------------------------------------------------------------------
 
+  @doc group: :distribution
   @doc """
   Mark a Dux for distributed execution across the given workers.
 
@@ -126,8 +163,20 @@ defmodule Dux do
     %{dux | workers: workers}
   end
 
+  @doc group: :distribution
   @doc """
-  Return to local execution (remove distributed workers).
+  Return to local execution, removing any distributed workers from the pipeline.
+
+  This is the inverse of `distribute/2`. After calling `local/1`, all subsequent
+  operations execute on the local node's DuckDB instance.
+
+  ## Examples
+
+      iex> df = Dux.from_list([%{x: 1}]) |> Dux.distribute([:fake])
+      iex> df.workers
+      [:fake]
+      iex> Dux.local(df).workers
+      nil
   """
   def local(%Dux{} = dux) do
     %{dux | workers: nil}
@@ -137,8 +186,9 @@ defmodule Dux do
   # IO — reading
   # ---------------------------------------------------------------------------
 
+  @doc group: :constructors
   @doc """
-  Read a CSV file.
+  Read a CSV file into a lazy Dux pipeline.
 
   All options are passed through to DuckDB's `read_csv()`.
 
@@ -154,15 +204,19 @@ defmodule Dux do
 
   ## Examples
 
-      df = Dux.from_csv("data/sales.csv")
+      iex> path = Path.join(Application.app_dir(:dux, "priv/datasets"), "airlines.csv")
+      iex> Dux.from_csv(path) |> Dux.to_rows() |> length()
+      16
+
       df = Dux.from_csv("data/sales.csv", delimiter: "\\t", skip: 1)
   """
   def from_csv(path, opts \\ []) when is_binary(path) do
     %Dux{source: {:csv, path, opts}}
   end
 
+  @doc group: :constructors
   @doc """
-  Read a Parquet file or glob pattern.
+  Read a Parquet file or glob pattern into a lazy Dux pipeline.
 
   Supports local files, globs, and remote URLs (S3, HTTP) when the
   appropriate DuckDB extension is loaded (httpfs).
@@ -172,17 +226,40 @@ defmodule Dux do
       df = Dux.from_parquet("data/sales.parquet")
       df = Dux.from_parquet("data/**/*.parquet")
       df = Dux.from_parquet("s3://bucket/data/*.parquet")
+
+  Write a Parquet file and read it back:
+
+      iex> path = Path.join(System.tmp_dir!(), "dux_doctest_#{:erlang.unique_integer([:positive])}.parquet")
+      iex> Dux.from_list([%{x: 1}, %{x: 2}, %{x: 3}]) |> Dux.to_parquet(path)
+      iex> Dux.from_parquet(path) |> Dux.to_columns()
+      %{"x" => [1, 2, 3]}
   """
   def from_parquet(path, opts \\ []) when is_binary(path) do
     %Dux{source: {:parquet, path, opts}}
   end
 
+  @doc group: :constructors
   @doc """
-  Read a newline-delimited JSON file.
+  Read a newline-delimited JSON (NDJSON) file into a lazy Dux pipeline.
+
+  Each line in the file must be a valid JSON object. This is a common format
+  for log files, streaming exports, and data interchange.
 
   ## Examples
 
       df = Dux.from_ndjson("events.ndjson")
+
+  NDJSON files look like this (one JSON object per line):
+
+      {"name": "Alice", "age": 30}
+      {"name": "Bob", "age": 25}
+
+  Write an NDJSON file and read it back:
+
+      iex> path = Path.join(System.tmp_dir!(), "dux_doctest_#{:erlang.unique_integer([:positive])}.ndjson")
+      iex> Dux.from_list([%{x: 1}, %{x: 2}]) |> Dux.to_ndjson(path)
+      iex> Dux.from_ndjson(path) |> Dux.to_columns()
+      %{"x" => [1, 2]}
   """
   def from_ndjson(path, opts \\ []) when is_binary(path) do
     %Dux{source: {:ndjson, path, opts}}
@@ -192,8 +269,12 @@ defmodule Dux do
   # IO — writing
   # ---------------------------------------------------------------------------
 
+  @doc group: :io
   @doc """
   Write a Dux to a CSV file. Triggers computation.
+
+  Returns `:ok` on success. The file is written atomically by DuckDB's
+  `COPY ... TO` statement.
 
   ## Options
 
@@ -204,11 +285,16 @@ defmodule Dux do
 
       Dux.from_query("SELECT * FROM range(10) t(x)")
       |> Dux.to_csv("/tmp/output.csv")
+
+      # With custom delimiter
+      Dux.from_list([%{name: "Alice", age: 30}])
+      |> Dux.to_csv("/tmp/output.tsv", delimiter: "\t")
   """
   def to_csv(%Dux{} = dux, path, opts \\ []) when is_binary(path) do
     write_copy(dux, path, "CSV", opts)
   end
 
+  @doc group: :io
   @doc """
   Write a Dux to a Parquet file. Triggers computation.
 
@@ -229,13 +315,21 @@ defmodule Dux do
     write_copy(dux, path, "PARQUET", opts)
   end
 
+  @doc group: :io
   @doc """
-  Write a Dux to a newline-delimited JSON file. Triggers computation.
+  Write a Dux to a newline-delimited JSON (NDJSON) file. Triggers computation.
+
+  Each row becomes a single JSON object on its own line. Returns `:ok` on success.
 
   ## Examples
 
       Dux.from_query("SELECT * FROM range(10) t(x)")
       |> Dux.to_ndjson("/tmp/output.ndjson")
+
+      # The resulting file contains one JSON object per line:
+      # {"x":0}
+      # {"x":1}
+      # ...
   """
   def to_ndjson(%Dux{} = dux, path, opts \\ []) when is_binary(path) do
     write_copy(dux, path, "JSON", opts)
@@ -245,6 +339,7 @@ defmodule Dux do
   # Selection verbs
   # ---------------------------------------------------------------------------
 
+  @doc group: :transforms
   @doc """
   Keep only the named columns.
 
@@ -258,6 +353,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:select, cols}]}
   end
 
+  @doc group: :transforms
   @doc """
   Drop the named columns.
 
@@ -275,6 +371,7 @@ defmodule Dux do
   # Filtering verbs
   # ---------------------------------------------------------------------------
 
+  @doc group: :transforms
   @doc """
   Filter rows matching a condition.
 
@@ -312,6 +409,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :transforms
   @doc """
   Filter rows using a raw SQL expression string or compiled `{sql, params}`.
 
@@ -334,8 +432,9 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:filter, inline_params(sql, params)}]}
   end
 
+  @doc group: :sorting
   @doc """
-  Take the first `n` rows (default 10).
+  Take the first `n` rows, defaulting to 10 if not specified.
 
   In IEx, the result is automatically displayed via the Inspect protocol.
   Use `peek/2` for an explicit table preview.
@@ -346,6 +445,13 @@ defmodule Dux do
       ...> |> Dux.head(3)
       ...> |> Dux.to_columns()
       %{"x" => [0, 1, 2]}
+
+      iex> Dux.from_query("SELECT * FROM range(100) t(x)")
+      ...> |> Dux.head()
+      ...> |> Dux.to_columns()
+      ...> |> Map.get("x")
+      ...> |> length()
+      10
   """
   def head(dux, n \\ 10)
 
@@ -353,6 +459,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:head, n}]}
   end
 
+  @doc group: :sorting
   @doc """
   Skip `offset` rows and take `length` rows.
 
@@ -366,6 +473,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:slice, offset, length}]}
   end
 
+  @doc group: :sorting
   @doc """
   Keep distinct rows, optionally by specific columns.
 
@@ -391,6 +499,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:distinct, cols}]}
   end
 
+  @doc group: :transforms
   @doc """
   Drop rows where any of the given columns are nil.
 
@@ -408,6 +517,7 @@ defmodule Dux do
   # Transformation verbs
   # ---------------------------------------------------------------------------
 
+  @doc group: :transforms
   @doc """
   Add or replace columns using expressions.
 
@@ -437,6 +547,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :transforms
   @doc """
   Add or replace columns using raw SQL expression strings or compiled tuples.
 
@@ -454,6 +565,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:mutate, assignments}]}
   end
 
+  @doc group: :transforms
   @doc """
   Rename columns.
 
@@ -477,6 +589,7 @@ defmodule Dux do
   # Sorting
   # ---------------------------------------------------------------------------
 
+  @doc group: :sorting
   @doc """
   Sort rows by columns.
 
@@ -501,6 +614,7 @@ defmodule Dux do
   # Grouping & Aggregation
   # ---------------------------------------------------------------------------
 
+  @doc group: :aggregation
   @doc """
   Group by columns for subsequent aggregation.
 
@@ -521,13 +635,25 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:group_by, cols}]}
   end
 
+  @doc group: :aggregation
   @doc """
-  Clear any active grouping.
+  Clear any active grouping set by `group_by/2`.
+
+  This removes all group columns so subsequent operations apply to the
+  full dataframe rather than per-group. The ungroup is tracked as an
+  operation in the pipeline and takes effect when compiled to SQL.
+
+  ## Examples
+
+      iex> df = Dux.from_list([%{g: "a", x: 1}]) |> Dux.group_by(:g) |> Dux.ungroup()
+      iex> {:ungroup} in df.ops
+      true
   """
   def ungroup(%Dux{ops: ops} = dux) do
     %{dux | ops: ops ++ [{:ungroup}]}
   end
 
+  @doc group: :aggregation
   @doc """
   Aggregate grouped data using expressions.
 
@@ -556,6 +682,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :aggregation
   @doc """
   Aggregate grouped data using raw SQL expression strings or compiled tuples.
 
@@ -579,6 +706,7 @@ defmodule Dux do
   # Joins
   # ---------------------------------------------------------------------------
 
+  @doc group: :joins
   @doc """
   Join two dataframes.
 
@@ -622,6 +750,7 @@ defmodule Dux do
   # Reshape
   # ---------------------------------------------------------------------------
 
+  @doc group: :reshape
   @doc """
   Pivot from long to wide format (PIVOT).
 
@@ -651,6 +780,7 @@ defmodule Dux do
     %{dux | ops: ops ++ [{:pivot_wider, names_col, values_col, agg}]}
   end
 
+  @doc group: :reshape
   @doc """
   Unpivot from wide to long format (UNPIVOT).
 
@@ -679,6 +809,7 @@ defmodule Dux do
   # Concatenation
   # ---------------------------------------------------------------------------
 
+  @doc group: :joins
   @doc """
   Concatenate rows from multiple dataframes (UNION ALL).
 
@@ -697,6 +828,7 @@ defmodule Dux do
   # Materialization
   # ---------------------------------------------------------------------------
 
+  @doc group: :materialization
   @doc """
   Compile the pipeline to SQL and execute against DuckDB.
 
@@ -763,6 +895,7 @@ defmodule Dux do
     end)
   end
 
+  @doc group: :distribution
   @doc """
   Collect distributed results back to a local `%Dux{}`.
 
@@ -784,6 +917,7 @@ defmodule Dux do
     %{computed | workers: nil}
   end
 
+  @doc group: :materialization
   @doc """
   Compute and return results as a list of maps.
 
@@ -816,6 +950,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :materialization
   @doc """
   Compute and return results as a map of column_name => [values].
 
@@ -848,6 +983,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :materialization
   @doc """
   Return the SQL that would be generated, without executing.
 
@@ -877,6 +1013,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :materialization
   @doc """
   Return the number of rows. Triggers computation.
 
@@ -896,15 +1033,21 @@ defmodule Dux do
   # ---------------------------------------------------------------------------
 
   if Code.ensure_loaded?(Nx) do
+    @doc group: :materialization
     @doc """
-    Convert a column to an Nx tensor.
+    Convert a single numeric column to an Nx tensor.
 
-    Triggers computation. The column must be a numeric type.
+    Triggers computation. The column must have a numeric DuckDB type (integer,
+    float, or decimal). Boolean columns are converted to `:u8`. Non-numeric
+    columns raise `ArgumentError`.
 
-        require Dux
+    Requires `Nx` to be available as a dependency.
+
+    ## Examples
+
         df = Dux.from_list([%{x: 1.0, y: 2.0}, %{x: 3.0, y: 4.0}])
         Dux.to_tensor(df, :x)
-        # #Nx.Tensor<f64[2] [1.0, 3.0]>
+        #=> #Nx.Tensor<f64[2] [1.0, 3.0]>
     """
     def to_tensor(%Dux{} = dux, column) do
       col_name = to_col_name(column)
@@ -940,6 +1083,7 @@ defmodule Dux do
     end
   end
 
+  @doc group: :materialization
   @doc """
   Print a formatted preview of the data. Triggers computation.
 
