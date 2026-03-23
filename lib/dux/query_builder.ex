@@ -259,6 +259,41 @@ defmodule Dux.QueryBuilder do
     {"SELECT * FROM #{left_ref} #{join_clause}", groups}
   end
 
+  defp op_to_sql({:json_unnest, column, path, as_col}, prev, groups) do
+    json_expr =
+      if path do
+        "json_extract(#{quote_ident(column)}, '#{String.replace(path, "'", "''")}')"
+      else
+        quote_ident(column)
+      end
+
+    sql =
+      "SELECT __src.*, je.value AS #{quote_ident(as_col)} FROM (SELECT * FROM #{prev}) __src, json_each(#{json_expr}) AS je"
+
+    {sql, groups}
+  end
+
+  defp op_to_sql({:asof_join, right, how, on_cols, {by_col, by_op}, _suffix}, prev, groups) do
+    right_db = Dux.Connection.get_conn()
+    {right_sql, _setup} = source_to_sql(right.source, right_db)
+    right_ref = "(#{right_sql}) __right"
+    left_ref = "(SELECT * FROM #{prev}) __left"
+
+    asof_type = asof_join_type_sql(how)
+    op_str = asof_op_to_sql(by_op)
+
+    eq_conditions =
+      Enum.map(on_cols, fn {l, r} ->
+        "__left.#{quote_ident(l)} = __right.#{quote_ident(r)}"
+      end)
+
+    inequality = "__left.#{quote_ident(by_col)} #{op_str} __right.#{quote_ident(by_col)}"
+    all_conditions = eq_conditions ++ [inequality]
+    on_clause = Enum.join(all_conditions, " AND ")
+
+    {"SELECT * FROM #{left_ref} #{asof_type} #{right_ref} ON #{on_clause}", groups}
+  end
+
   defp op_to_sql({:concat_rows, others}, prev, groups) do
     # UNION ALL the current result with each other Dux
     union_parts =
@@ -327,6 +362,14 @@ defmodule Dux.QueryBuilder do
   defp join_type_sql(:cross), do: "CROSS JOIN"
   defp join_type_sql(:anti), do: "ANTI JOIN"
   defp join_type_sql(:semi), do: "SEMI JOIN"
+
+  defp asof_join_type_sql(:inner), do: "ASOF JOIN"
+  defp asof_join_type_sql(:left), do: "ASOF LEFT JOIN"
+
+  defp asof_op_to_sql(:>=), do: ">="
+  defp asof_op_to_sql(:>), do: ">"
+  defp asof_op_to_sql(:<=), do: "<="
+  defp asof_op_to_sql(:<), do: "<"
 
   defp encode_value(nil), do: "NULL"
   defp encode_value(v) when is_integer(v), do: Integer.to_string(v)
