@@ -20,11 +20,13 @@ if Code.ensure_loaded?(FLAME) do
             ],
             min: 0,
             max: 10,
+            max_concurrency: 1,
             backend: {FLAME.FlyBackend,
               cpu_kind: "performance", cpus: 4, memory_mb: 8192,
               token: System.fetch_env!("FLY_API_TOKEN"),
-              env: Map.take(System.get_env(), ["LIVEBOOK_COOKIE"])
+              env: %{"LIVEBOOK_COOKIE" => Atom.to_string(Node.get_cookie())}
             },
+            boot_timeout: 120_000,
             idle_shutdown_after: :timer.minutes(5)}
         )
 
@@ -45,6 +47,7 @@ if Code.ensure_loaded?(FLAME) do
           name: :dux_pool,
           backend: {FLAME.FlyBackend, ...},
           max: 10,
+          max_concurrency: 1,
           code_sync: [start_apps: [:dux], copy_apps: true],
           idle_shutdown_after: :timer.minutes(5)}
 
@@ -54,6 +57,8 @@ if Code.ensure_loaded?(FLAME) do
     Workers read S3 data directly — nothing flows through your machine.
     After idle timeout, FLAME auto-terminates the runners.
     """
+
+    alias Dux.Remote.Worker
 
     @default_pool Dux.FlamePool
 
@@ -69,56 +74,65 @@ if Code.ensure_loaded?(FLAME) do
     """
     def spin_up(n, opts \\ []) when is_integer(n) and n > 0 do
       pool = Keyword.get(opts, :pool, @default_pool)
+      setup = Keyword.get(opts, :setup)
 
+      # Place workers sequentially. With max_concurrency: 1, each placed
+      # child holds its concurrency slot permanently, so the next
+      # place_child boots a new runner. Sequential avoids internal FLAME
+      # GenServer timeouts that occur with concurrent placement.
       workers =
         for _ <- 1..n do
           {:ok, pid} = FLAME.place_child(pool, {Dux.Remote.Worker, []})
           pid
         end
 
-      await_pg_registration(workers)
-      workers
-    end
-
-    defp await_pg_registration(workers, timeout_ms \\ 5_000) do
-      expected = MapSet.new(workers)
-      deadline = System.monotonic_time(:millisecond) + timeout_ms
-      do_await_pg(expected, deadline)
-    end
-
-    defp do_await_pg(expected, deadline) do
-      registered =
-        :pg.get_members(:dux, Dux.Remote.Worker)
-        |> MapSet.new()
-
-      if MapSet.subset?(expected, registered) do
-        :ok
-      else
-        if System.monotonic_time(:millisecond) > deadline do
-          # Best-effort: proceed even if not all registered yet
-          :ok
-        else
-          Process.sleep(10)
-          do_await_pg(expected, deadline)
-        end
+      # Run setup callback on each worker (e.g. create S3 secrets, load extensions)
+      if setup do
+        workers
+        |> Task.async_stream(
+          fn worker -> GenServer.call(worker, {:setup, setup}, 30_000) end,
+          timeout: 60_000
+        )
+        |> Enum.each(fn
+          {:ok, :ok} -> :ok
+          {:ok, {:error, reason}} -> raise "Worker setup failed: #{reason}"
+          {:exit, reason} -> raise "Worker setup crashed: #{inspect(reason)}"
+        end)
       end
+
+      workers
     end
 
     @doc """
     Get status of the FLAME-backed Dux cluster.
 
-    Returns worker count and PIDs, grouped by node.
-    """
-    alias Dux.Remote.Worker
+    Pass the workers list returned by `spin_up/2`, or omit to
+    discover workers via `:pg` (may not find remote FLAME workers).
 
-    def status(pool \\ @default_pool) do
+    Returns worker count grouped by node, with alive status.
+    """
+    def status(workers_or_pool \\ @default_pool)
+
+    def status(workers) when is_list(workers) do
+      nodes =
+        workers
+        |> Enum.group_by(&node/1)
+        |> Map.new(fn {n, pids} -> {n, length(pids)} end)
+
+      %{
+        total_workers: length(workers),
+        nodes: nodes,
+        worker_pids: workers
+      }
+    end
+
+    def status(pool) when is_atom(pool) do
       workers = Worker.list()
 
       nodes =
         workers
         |> Enum.group_by(&node/1)
-        |> Enum.map(fn {node, pids} -> {node, length(pids)} end)
-        |> Map.new()
+        |> Map.new(fn {n, pids} -> {n, length(pids)} end)
 
       %{
         pool: pool,
