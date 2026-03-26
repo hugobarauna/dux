@@ -107,6 +107,9 @@ defmodule Dux.QueryBuilder do
         else
           columns = rows_to_columns(rows)
           table_ref = ingest_columns(conn, columns)
+          # Keep ref alive in process dictionary to prevent GC before query executes.
+          existing = Process.get(:dux_ipc_refs, [])
+          Process.put(:dux_ipc_refs, [table_ref | existing])
           {~s(SELECT * FROM "#{escape_sql_string(table_ref.name)}"), []}
         end
     end
@@ -508,24 +511,28 @@ defmodule Dux.QueryBuilder do
     end
   end
 
+  @doc false
   # Convert row-oriented list of maps to Adbc.Column format for ingest.
-  defp rows_to_columns(rows) do
-    # Get all column names from the first row
-    col_names =
-      rows
-      |> hd()
-      |> Map.keys()
-      |> Enum.map(&to_string/1)
-      |> Enum.sort()
+  # Assumes all rows have the same key type (all atoms or all strings).
+  # Mixed key types will raise on Map.fetch! — callers should normalize first.
+  def rows_to_columns(rows) do
+    first_row = hd(rows)
+    raw_keys = Map.keys(first_row)
 
-    Enum.map(col_names, fn name ->
-      values =
-        Enum.map(rows, fn row ->
-          # Try both string and atom keys
-          Map.get(row, name) || Map.get(row, String.to_atom(name))
-        end)
+    # Build {string_name, map_key} pairs — string names for ADBC columns,
+    # original keys (atom or string) for Map.fetch! on each row.
+    col_pairs =
+      case hd(raw_keys) do
+        k when is_atom(k) ->
+          raw_keys |> Enum.map(fn k -> {Atom.to_string(k), k} end) |> Enum.sort()
 
-      Adbc.Column.new(values, name: name)
+        k when is_binary(k) ->
+          raw_keys |> Enum.map(fn k -> {k, k} end) |> Enum.sort()
+      end
+
+    Enum.map(col_pairs, fn {col_name, map_key} ->
+      values = Enum.map(rows, fn row -> Map.fetch!(row, map_key) end)
+      Adbc.Column.new(values, name: col_name)
     end)
   end
 
