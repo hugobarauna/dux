@@ -1953,11 +1953,12 @@ defmodule Dux do
   defp derive_op_schema(_, _n, _d, _g), do: nil
 
   # Views can be used when:
-  # 1. Source is an already-materialized table (not list/parquet/csv/etc.)
-  # 2. Source has no chained deps (prevents infinite dependency chains in iterative algorithms)
+  # 1. Source is an already-materialized table/view (not list/parquet/csv/etc.)
+  # 2. Dependency depth is within limit (prevents unbounded memory in iterative algorithms)
   # 3. No PIVOT ops (DuckDB doesn't support data-driven PIVOT in views)
+  @max_view_depth 3
   defp can_use_view?(%Dux{ops: ops, source: {:table, %Dux.TableRef{deps: deps}}}) do
-    deps == [] and
+    view_depth(deps, 0) < @max_view_depth and
       not Enum.any?(ops, fn
         {:pivot_wider, _, _, _} -> true
         {:pivot_longer, _, _, _} -> true
@@ -1966,6 +1967,14 @@ defmodule Dux do
   end
 
   defp can_use_view?(_), do: false
+
+  defp view_depth([], depth), do: depth
+
+  defp view_depth([%Dux.TableRef{deps: inner_deps} | rest], depth) do
+    max(view_depth(inner_deps, depth + 1), view_depth(rest, depth))
+  end
+
+  defp view_depth([_ | rest], depth), do: view_depth(rest, depth)
 
   # Collect all TableRef dependencies that a view needs to keep alive.
   # Without this, the GC could drop source tables that the view references.
