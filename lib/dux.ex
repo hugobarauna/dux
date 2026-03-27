@@ -1877,21 +1877,20 @@ defmodule Dux do
   # Tracks group state for summarise derivation.
   defp derive_schema(%Dux{names: names, dtypes: dtypes, ops: ops})
        when names != [] and dtypes != %{} do
-    case Enum.reduce_while(ops, {names, dtypes, []}, fn op, {names, dtypes, groups} ->
-           case derive_op_schema(op, names, dtypes, groups) do
-             {new_names, new_dtypes, new_groups} ->
-               {:cont, {new_names, new_dtypes, new_groups}}
-
-             nil ->
-               {:halt, nil}
-           end
-         end) do
+    case Enum.reduce_while(ops, {names, dtypes, []}, &derive_op_step/2) do
       {names, dtypes, _groups} -> {names, dtypes}
       nil -> nil
     end
   end
 
   defp derive_schema(_), do: nil
+
+  defp derive_op_step(op, {names, dtypes, groups}) do
+    case derive_op_schema(op, names, dtypes, groups) do
+      {_, _, _} = result -> {:cont, result}
+      nil -> {:halt, nil}
+    end
+  end
 
   # Schema-preserving ops
   defp derive_op_schema({:filter, _}, n, d, g), do: {n, d, g}
