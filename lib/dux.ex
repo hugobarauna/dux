@@ -1418,6 +1418,10 @@ defmodule Dux do
     dux
   end
 
+  # Local no-ops: table is already materialized, skip redundant CTAS/view.
+  def compute(%Dux{source: {:table, _}, ops: [], workers: nil} = dux, _opts), do: dux
+  def compute(%Dux{source: {:table, _}, ops: [], workers: []} = dux, _opts), do: dux
+
   def compute(%Dux{workers: workers} = dux, opts) when is_list(workers) and workers != [] do
     meta = %{n_ops: length(dux.ops), distributed: true}
 
@@ -1450,7 +1454,17 @@ defmodule Dux do
         Dux.Backend.execute(conn, setup_sql)
       end)
 
-      {table_ref, n_rows} = Dux.Backend.query_with_count(conn, sql)
+      use_view = can_use_view?(dux)
+
+      {table_ref, n_rows} =
+        if use_view do
+          # Views are near-instant (no data materialization).
+          # deps keeps source tables alive so the view can reference them.
+          deps = collect_source_deps(dux)
+          {Dux.Backend.query_view(conn, sql, deps), nil}
+        else
+          Dux.Backend.query_with_count(conn, sql)
+        end
 
       {names, dtypes} =
         if schema_preserved?(dux) do
@@ -1880,6 +1894,29 @@ defmodule Dux do
   end
 
   defp schema_preserved?(_), do: false
+
+  # Views can be used when:
+  # 1. Source is an already-materialized table (not list/parquet/csv/etc.)
+  # 2. Source has no chained deps (prevents infinite dependency chains in iterative algorithms)
+  # 3. No PIVOT ops (DuckDB doesn't support data-driven PIVOT in views)
+  defp can_use_view?(%Dux{ops: ops, source: {:table, %Dux.TableRef{deps: deps}}}) do
+    deps == [] and
+      not Enum.any?(ops, fn
+        {:pivot_wider, _, _, _} -> true
+        {:pivot_longer, _, _, _} -> true
+        _ -> false
+      end)
+  end
+
+  defp can_use_view?(_), do: false
+
+  # Collect all TableRef dependencies that a view needs to keep alive.
+  # Without this, the GC could drop source tables that the view references.
+  defp collect_source_deps(%Dux{source: {:table, %Dux.TableRef{} = ref}}) do
+    [ref | ref.deps]
+  end
+
+  defp collect_source_deps(_), do: []
 
   defp extract_source_ref(%Dux{source: {:table, ref}}), do: ref
 

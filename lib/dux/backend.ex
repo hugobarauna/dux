@@ -62,6 +62,28 @@ defmodule Dux.Backend do
   end
 
   @doc false
+  def query_view(conn, sql, deps \\ []) do
+    # Like query/2 but creates a temp VIEW instead of a temp TABLE.
+    # Near-instant since no data is materialized.
+    # Views use __dux_v_ prefix so the ADBC GC handler knows to DROP VIEW.
+    name = "__dux_v_#{:erlang.unique_integer([:positive])}"
+
+    case Adbc.Connection.query(conn, "CREATE TEMPORARY VIEW #{qi(name)} AS (#{sql})") do
+      {:ok, _} ->
+        :ok
+
+      {:error, %Adbc.Error{} = err} ->
+        raise ArgumentError, "DuckDB query failed: #{err.message}"
+
+      {:error, err} ->
+        raise ArgumentError, "DuckDB query failed: #{Exception.message(err)}"
+    end
+
+    gc_ref = Adbc.Nif.adbc_delete_on_gc_new(conn, name)
+    %TableRef{name: name, gc_ref: gc_ref, node: node(), deps: deps}
+  end
+
+  @doc false
   def query_with_count(conn, sql) do
     # Like query/2 but also returns the row count from the CTAS result,
     # avoiding a separate COUNT(*) query for telemetry.
