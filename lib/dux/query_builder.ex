@@ -25,6 +25,12 @@ defmodule Dux.QueryBuilder do
         {sql, _groups} = op_to_sql(single_op, initial_prev, [])
         {sql, setup}
 
+      [{:group_by, cols}, {:summarise, aggs}] ->
+        # Common pattern: group_by + summarise. Emit flat SQL without CTE.
+        initial_prev = direct_source_ref(source) || "(#{source_sql}) __src"
+        {sql, _groups} = op_to_sql({:summarise, aggs}, initial_prev, cols)
+        {sql, setup}
+
       ops ->
         initial_prev = direct_source_ref(source) || "(#{source_sql}) __src"
         {ctes, _counter, _groups} = build_ctes(ops, initial_prev, 0, [])
