@@ -1451,7 +1451,14 @@ defmodule Dux do
       end)
 
       {table_ref, n_rows} = Dux.Backend.query_with_count(conn, sql)
-      {names, dtypes} = Dux.Backend.table_schema(conn, table_ref)
+
+      {names, dtypes} =
+        if schema_preserved?(dux) do
+          {dux.names, dux.dtypes}
+        else
+          Dux.Backend.table_schema(conn, table_ref)
+        end
+
       result = %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes, conn: conn}
 
       Process.delete(:dux_compute_ref)
@@ -1855,6 +1862,25 @@ defmodule Dux do
 
   # Extract any NIF resource refs from the source to keep them alive
   # across function calls that reference temp tables by name.
+  # Returns true when all ops preserve the source schema (same columns, same types).
+  # When true, compute/1 can skip the DESCRIBE round-trip and reuse the source schema.
+  defp schema_preserved?(%Dux{names: names, dtypes: dtypes, ops: ops})
+       when names != [] and dtypes != %{} do
+    Enum.all?(ops, fn
+      {:filter, _} -> true
+      {:head, _} -> true
+      {:slice, _, _} -> true
+      {:sort_by, _} -> true
+      {:distinct, nil} -> true
+      {:drop_nil, _} -> true
+      {:group_by, _} -> true
+      {:ungroup} -> true
+      _ -> false
+    end)
+  end
+
+  defp schema_preserved?(_), do: false
+
   defp extract_source_ref(%Dux{source: {:table, ref}}), do: ref
 
   defp extract_source_ref(%Dux{ops: ops} = dux) do
