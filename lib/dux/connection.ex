@@ -83,13 +83,7 @@ defmodule Dux.Connection do
     conns =
       for _ <- 1..pool_size do
         {:ok, conn} = Adbc.Connection.start_link(database: db)
-
-        # Disable insertion order preservation for temp table materialization.
-        # This lets DuckDB parallelize CREATE TABLE AS across threads without
-        # coordinating row order — ~5x faster for large result sets.
-        # Users who need ordered output use Dux.sort_by/2 explicitly.
-        Adbc.Connection.query!(conn, "SET preserve_insertion_order = false")
-
+        configure_duckdb(conn, opts)
         conn
       end
 
@@ -136,5 +130,45 @@ defmodule Dux.Connection do
   @impl true
   def handle_call(:get_db, _from, %{conns: [conn | _]} = state) do
     {:reply, conn, state}
+  end
+
+  # Apply DuckDB configuration settings to a connection.
+  # Shared by Connection (local) and Worker (distributed).
+  @memory_limit_pattern ~r/^\d+(\.\d+)?\s*(B|KB|KiB|MB|MiB|GB|GiB|TB|TiB)$/i
+
+  @doc false
+  def configure_duckdb(conn, opts \\ []) do
+    # Disable insertion order preservation — allows DuckDB to parallelize
+    # CREATE TABLE AS across threads. ~5x faster for large result sets.
+    Adbc.Connection.query!(conn, "SET preserve_insertion_order = false")
+
+    # Memory limit — caps DuckDB's memory usage. Important when multiple
+    # workers share a machine. Only set when explicitly configured.
+    # Security: regex validation is the boundary — DuckDB SET doesn't
+    # support parameterized values, so interpolation is unavoidable.
+    if memory_limit = Keyword.get(opts, :memory_limit) do
+      unless memory_limit =~ @memory_limit_pattern do
+        raise ArgumentError,
+              "invalid memory_limit: #{inspect(memory_limit)}, expected format like \"2GB\" or \"512MB\""
+      end
+
+      Adbc.Connection.query!(conn, "SET memory_limit = '#{memory_limit}'")
+    end
+
+    # Temp directory for spill-to-disk. Only set when explicitly configured —
+    # otherwise DuckDB uses its own default. This avoids creating directories
+    # as a side effect and works on read-only filesystems.
+    if temp_dir = Keyword.get(opts, :temp_directory) do
+      # Allowlist: only permit path-safe characters (alphanumeric, /, -, _, ., ~, space)
+      unless temp_dir =~ ~r{^[a-zA-Z0-9/_\-. ~]+$} do
+        raise ArgumentError,
+              "temp_directory contains invalid characters: #{inspect(temp_dir)}"
+      end
+
+      File.mkdir_p(temp_dir)
+      Adbc.Connection.query!(conn, "SET temp_directory = '#{temp_dir}'")
+    end
+
+    :ok
   end
 end

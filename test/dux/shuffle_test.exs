@@ -209,6 +209,318 @@ defmodule Dux.ShuffleTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Worker resource configuration
+  # ---------------------------------------------------------------------------
+
+  describe "worker memory configuration" do
+    test "worker accepts memory_limit option" do
+      {:ok, w} = Worker.start_link(memory_limit: "256MB")
+
+      on_exit(fn -> stop_worker(w) end)
+
+      {:ok, ipc} =
+        Worker.execute(
+          w,
+          Dux.from_query("SELECT current_setting('memory_limit') AS ml")
+        )
+
+      conn = Dux.Connection.get_conn()
+      ref = Dux.Backend.table_from_ipc(conn, ipc)
+      [row] = Dux.Backend.table_to_rows(conn, ref)
+      assert row["ml"] =~ "MiB"
+    end
+
+    test "worker accepts temp_directory option" do
+      tmp =
+        Path.join(
+          System.tmp_dir!(),
+          "dux_test_worker_spill_#{System.unique_integer([:positive])}"
+        )
+
+      {:ok, w} = Worker.start_link(temp_directory: tmp)
+
+      on_exit(fn ->
+        stop_worker(w)
+        File.rm_rf!(tmp)
+      end)
+
+      {:ok, ipc} =
+        Worker.execute(
+          w,
+          Dux.from_query("SELECT current_setting('temp_directory') AS td")
+        )
+
+      conn = Dux.Connection.get_conn()
+      ref = Dux.Backend.table_from_ipc(conn, ipc)
+      [row] = Dux.Backend.table_to_rows(conn, ref)
+      assert row["td"] == tmp
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Scale / wicked
+  # ---------------------------------------------------------------------------
+
+  describe "scale" do
+    test "shuffle with 1000+ rows produces correct count" do
+      workers = start_workers(2)
+
+      left = Dux.from_query("SELECT x AS key, x * 10 AS val FROM range(2000) t(x)")
+      right = Dux.from_query("SELECT x AS key, x * 0.5 AS score FROM range(2000) t(x)")
+
+      result = Shuffle.execute(left, right, on: :key, workers: workers)
+      assert Dux.n_rows(result) == 2000
+    end
+
+    test "shuffle with 4 workers" do
+      workers = start_workers(4)
+
+      left = Dux.from_query("SELECT x AS id, x * 2 AS val FROM range(500) t(x)")
+      right = Dux.from_query("SELECT x AS id, CONCAT('row_', x) AS label FROM range(500) t(x)")
+
+      result = Shuffle.execute(left, right, on: :id, workers: workers)
+      assert Dux.n_rows(result) == 500
+    end
+
+    test "shuffle result feeds into downstream pipeline" do
+      workers = start_workers(2)
+
+      left = Dux.from_query("SELECT x AS key, x AS amount FROM range(100) t(x)")
+
+      right =
+        Dux.from_query(
+          "SELECT x AS key, CASE WHEN x % 2 = 0 THEN 'even' ELSE 'odd' END AS grp FROM range(100) t(x)"
+        )
+
+      rows =
+        Shuffle.execute(left, right, on: :key, workers: workers)
+        |> Dux.group_by("grp")
+        |> Dux.summarise_with(total: "SUM(amount)", n: "COUNT(*)")
+        |> Dux.sort_by("grp")
+        |> Dux.to_rows()
+
+      assert length(rows) == 2
+      total = rows |> Enum.map(& &1["total"]) |> Enum.sum()
+      # Sum of 0..99 = 4950
+      assert total == 4950
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Adversarial: skewed data
+  # ---------------------------------------------------------------------------
+
+  describe "skewed data" do
+    test "highly skewed join keys still produce correct results" do
+      workers = start_workers(2)
+
+      # 90% of left rows have key=1, 10% have key=2
+      left =
+        Dux.from_query("""
+          SELECT 1 AS key, x AS val FROM range(90) t(x)
+          UNION ALL
+          SELECT 2 AS key, x AS val FROM range(10) t(x)
+        """)
+
+      right =
+        Dux.from_list([
+          %{key: 1, label: "majority"},
+          %{key: 2, label: "minority"}
+        ])
+
+      result =
+        Shuffle.execute(left, right, on: :key, workers: workers)
+        |> Dux.sort_by(:key)
+        |> Dux.to_rows()
+
+      key_1_count = Enum.count(result, &(&1["key"] == 1))
+      key_2_count = Enum.count(result, &(&1["key"] == 2))
+
+      assert key_1_count == 90
+      assert key_2_count == 10
+    end
+
+    test "single-key join (all rows same key) works" do
+      workers = start_workers(2)
+
+      left = Dux.from_query("SELECT 1 AS key, x AS val FROM range(50) t(x)")
+      right = Dux.from_list([%{key: 1, label: "only"}])
+
+      result = Shuffle.execute(left, right, on: :key, workers: workers)
+      assert Dux.n_rows(result) == 50
+    end
+
+    test "skew mitigation splits heavy buckets and produces correct results" do
+      workers = start_workers(2)
+
+      # 90% key=1, 10% key=2. With skew_min_bytes: 0, the heavy bucket triggers splitting.
+      left =
+        Dux.from_query("""
+          SELECT 1 AS key, x AS val FROM range(90) t(x)
+          UNION ALL
+          SELECT 2 AS key, x AS val FROM range(10) t(x)
+        """)
+
+      right =
+        Dux.from_list([
+          %{key: 1, label: "majority"},
+          %{key: 2, label: "minority"}
+        ])
+
+      # Force skew mitigation by setting threshold to 0 bytes
+      result =
+        Shuffle.execute(left, right,
+          on: :key,
+          workers: workers,
+          skew_min_bytes: 0
+        )
+
+      rows = result |> Dux.sort_by(:key) |> Dux.to_rows()
+      key_1 = Enum.count(rows, &(&1["key"] == 1))
+      key_2 = Enum.count(rows, &(&1["key"] == 2))
+
+      assert key_1 == 90
+      assert key_2 == 10
+      assert length(rows) == 100
+    end
+
+    test "skew mitigation emits telemetry when data is heavily skewed" do
+      workers = start_workers(2)
+
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        "skew-test-#{inspect(ref)}",
+        [:dux, :distributed, :shuffle, :skew_detected],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:skew, measurements, metadata})
+        end,
+        nil
+      )
+
+      # Generate enough data that the heavy bucket's IPC byte_size is >5x mean.
+      # 10K rows in key=1, 10 rows each in keys 2-8 — extreme skew.
+      left =
+        Dux.from_query("""
+          SELECT 1 AS key, x AS val, REPEAT('x', 100) AS pad FROM range(10000) t(x)
+          UNION ALL
+          SELECT x % 7 + 2 AS key, x AS val, 'y' AS pad FROM range(70) t(x)
+        """)
+
+      right =
+        Dux.from_query("SELECT x AS key, CONCAT('label_', x) AS label FROM range(1, 9) t(x)")
+
+      _result =
+        Shuffle.execute(left, right,
+          on: :key,
+          workers: workers,
+          skew_min_bytes: 0
+        )
+
+      assert_receive {:skew, measurements, _metadata}, 2000
+      assert measurements.left_heavy_count > 0
+
+      :telemetry.detach("skew-test-#{inspect(ref)}")
+    end
+
+    test "skew-mitigated result matches local join" do
+      workers = start_workers(2)
+
+      left =
+        Dux.from_query("""
+          SELECT CASE WHEN x < 80 THEN 1 ELSE x END AS key, x AS val
+          FROM range(100) t(x)
+        """)
+
+      right =
+        Dux.from_query("SELECT x AS key, CONCAT('r_', x) AS label FROM range(100) t(x)")
+
+      local_rows =
+        left
+        |> Dux.join(right, on: :key)
+        |> Dux.sort_by(:val)
+        |> Dux.to_rows()
+
+      shuffle_rows =
+        Shuffle.execute(left, right,
+          on: :key,
+          workers: workers,
+          skew_min_bytes: 0
+        )
+        |> Dux.sort_by(:val)
+        |> Dux.to_rows()
+
+      assert length(shuffle_rows) == length(local_rows)
+
+      local_keys = Enum.map(local_rows, & &1["key"]) |> Enum.sort()
+      shuffle_keys = Enum.map(shuffle_rows, & &1["key"]) |> Enum.sort()
+      assert shuffle_keys == local_keys
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Input validation
+  # ---------------------------------------------------------------------------
+
+  describe "configure_duckdb validation" do
+    test "rejects invalid memory_limit format" do
+      {_db, conn} = Dux.Backend.open()
+
+      assert_raise ArgumentError, ~r/invalid memory_limit/, fn ->
+        Dux.Connection.configure_duckdb(conn, memory_limit: "lots")
+      end
+    end
+
+    test "rejects temp_directory with non-path characters" do
+      {_db, conn} = Dux.Backend.open()
+
+      for bad_path <- ["/tmp/it's bad", "/tmp/foo;bar", "/tmp/back\\slash", "/tmp/$var"] do
+        assert_raise ArgumentError, ~r/invalid characters/, fn ->
+          Dux.Connection.configure_duckdb(conn, temp_directory: bad_path)
+        end
+      end
+    end
+
+    test "left join shuffle skips skew mitigation and produces correct results" do
+      workers = start_workers(2)
+
+      left =
+        Dux.from_query("""
+          SELECT 1 AS key, x AS val FROM range(90) t(x)
+          UNION ALL
+          SELECT 2 AS key, x AS val FROM range(10) t(x)
+        """)
+
+      right = Dux.from_list([%{key: 1, label: "matched"}])
+
+      # Left join — all left rows preserved, unmatched get NULL on right
+      result =
+        Shuffle.execute(left, right,
+          on: :key,
+          how: :left,
+          workers: workers,
+          skew_min_bytes: 0
+        )
+        |> Dux.to_rows()
+
+      assert length(result) == 100
+      matched = Enum.count(result, &(&1["label"] == "matched"))
+      unmatched = Enum.count(result, &is_nil(&1["label"]))
+      assert matched == 90
+      assert unmatched == 10
+    end
+
+    test "accepts valid memory_limit formats" do
+      {_db, conn} = Dux.Backend.open()
+
+      for fmt <- ["256MB", "2GB", "1.5GiB", "512MiB", "100KB"] do
+        assert :ok = Dux.Connection.configure_duckdb(conn, memory_limit: fmt)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Correctness: shuffle == local join
   # ---------------------------------------------------------------------------
 
