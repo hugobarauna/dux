@@ -1467,10 +1467,9 @@ defmodule Dux do
         end
 
       {names, dtypes} =
-        if schema_preserved?(dux) do
-          {dux.names, dux.dtypes}
-        else
-          Dux.Backend.table_schema(conn, table_ref)
+        case derive_schema(dux) do
+          {names, dtypes} -> {names, dtypes}
+          nil -> Dux.Backend.table_schema(conn, table_ref)
         end
 
       result = %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes, conn: conn}
@@ -1874,26 +1873,71 @@ defmodule Dux do
   # Internal helpers
   # ---------------------------------------------------------------------------
 
-  # Extract any NIF resource refs from the source to keep them alive
-  # across function calls that reference temp tables by name.
-  # Returns true when all ops preserve the source schema (same columns, same types).
-  # When true, compute/1 can skip the DESCRIBE round-trip and reuse the source schema.
-  defp schema_preserved?(%Dux{names: names, dtypes: dtypes, ops: ops})
+  # Derive the output schema from the source schema and ops, without running DESCRIBE.
+  # Returns {names, dtypes} if derivable, nil otherwise.
+  defp derive_schema(%Dux{names: names, dtypes: dtypes, ops: ops})
        when names != [] and dtypes != %{} do
-    Enum.all?(ops, fn
-      {:filter, _} -> true
-      {:head, _} -> true
-      {:slice, _, _} -> true
-      {:sort_by, _} -> true
-      {:distinct, nil} -> true
-      {:drop_nil, _} -> true
-      {:group_by, _} -> true
-      {:ungroup} -> true
-      _ -> false
+    Enum.reduce_while(ops, {names, dtypes}, fn op, {names, dtypes} ->
+      case derive_op_schema(op, names, dtypes) do
+        {new_names, new_dtypes} -> {:cont, {new_names, new_dtypes}}
+        nil -> {:halt, nil}
+      end
     end)
   end
 
-  defp schema_preserved?(_), do: false
+  defp derive_schema(_), do: nil
+
+  # Schema-preserving ops
+  defp derive_op_schema({:filter, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:head, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:slice, _, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:sort_by, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:distinct, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:drop_nil, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:group_by, _}, names, dtypes), do: {names, dtypes}
+  defp derive_op_schema({:ungroup}, names, dtypes), do: {names, dtypes}
+
+  # Mutate: SELECT *, (expr) AS col — adds columns (DuckDB replaces if name exists)
+  defp derive_op_schema({:mutate, assignments}, names, dtypes) do
+    new_names =
+      Enum.reduce(assignments, names, fn {col_name, _expr}, acc ->
+        if col_name in acc, do: acc, else: acc ++ [col_name]
+      end)
+
+    {new_names, dtypes}
+  end
+
+  # Select: picks specific columns
+  defp derive_op_schema({:select, cols}, _names, dtypes) do
+    col_strings = Enum.map(cols, &to_string/1)
+    new_dtypes = Map.take(dtypes, col_strings)
+    {col_strings, new_dtypes}
+  end
+
+  # Discard: removes columns
+  defp derive_op_schema({:discard, cols}, names, dtypes) do
+    col_strings = MapSet.new(Enum.map(cols, &to_string/1))
+    new_names = Enum.reject(names, &MapSet.member?(col_strings, &1))
+    new_dtypes = Map.drop(dtypes, MapSet.to_list(col_strings))
+    {new_names, new_dtypes}
+  end
+
+  # Rename: changes column names
+  defp derive_op_schema({:rename, pairs}, names, dtypes) do
+    rename_map = Map.new(pairs, fn {old, new} -> {to_string(old), to_string(new)} end)
+
+    new_names = Enum.map(names, fn n -> Map.get(rename_map, n, n) end)
+
+    new_dtypes =
+      Map.new(dtypes, fn {k, v} ->
+        {Map.get(rename_map, k, k), v}
+      end)
+
+    {new_names, new_dtypes}
+  end
+
+  # Everything else: can't derive
+  defp derive_op_schema(_, _names, _dtypes), do: nil
 
   # Views can be used when:
   # 1. Source is an already-materialized table (not list/parquet/csv/etc.)
