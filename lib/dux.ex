@@ -158,8 +158,7 @@ defmodule Dux do
         node: node()
       }
 
-      names = Dux.Backend.table_names(conn, table_ref)
-      dtypes = Dux.Backend.table_dtypes(conn, table_ref) |> Map.new()
+      {names, dtypes} = Dux.Backend.table_schema(conn, table_ref)
       %Dux{source: {:table, table_ref}, names: names, dtypes: dtypes, conn: conn}
     else
       %Dux{source: {:list, rows}}
