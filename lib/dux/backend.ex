@@ -61,6 +61,28 @@ defmodule Dux.Backend do
     %TableRef{name: name, gc_ref: gc_ref, node: node()}
   end
 
+  @doc false
+  def query_view(conn, sql, deps \\ []) do
+    # Like query/2 but creates a VIEW — near-instant since no data is copied.
+    # The deps list keeps source TableRefs alive so GC doesn't drop tables
+    # that the view references.
+    name = "__dux_v_#{:erlang.unique_integer([:positive])}"
+
+    case Adbc.Connection.query(conn, "CREATE TEMPORARY VIEW #{qi(name)} AS (#{sql})") do
+      {:ok, _} ->
+        :ok
+
+      {:error, %Adbc.Error{} = err} ->
+        raise ArgumentError, "DuckDB query failed: #{err.message}"
+
+      {:error, err} ->
+        raise ArgumentError, "DuckDB query failed: #{Exception.message(err)}"
+    end
+
+    gc_ref = Adbc.Nif.adbc_execute_on_gc_new(conn, "DROP VIEW IF EXISTS #{qi(name)}")
+    %TableRef{name: name, gc_ref: gc_ref, node: node(), deps: deps}
+  end
+
   # ---------------------------------------------------------------------------
   # Metadata
   # ---------------------------------------------------------------------------
@@ -79,6 +101,20 @@ defmodule Dux.Backend do
     |> Enum.map(fn {col_name, duckdb_type} ->
       {col_name, duckdb_type_string_to_dtype(duckdb_type)}
     end)
+  end
+
+  @doc false
+  def table_schema(conn, %TableRef{name: name}) do
+    {names, types} = describe_table(conn, name)
+
+    dtypes =
+      Enum.zip(names, types)
+      |> Enum.map(fn {col_name, duckdb_type} ->
+        {col_name, duckdb_type_string_to_dtype(duckdb_type)}
+      end)
+      |> Map.new()
+
+    {names, dtypes}
   end
 
   @doc false
@@ -111,7 +147,7 @@ defmodule Dux.Backend do
       names = table_names(conn, ref)
       Map.new(names, fn name -> {name, []} end)
     else
-      Map.new(map, fn {k, vs} -> {k, Enum.map(vs, &normalize_value/1)} end)
+      Map.new(map, fn {k, vs} -> {k, maybe_normalize(vs)} end)
     end
   end
 
@@ -157,13 +193,32 @@ defmodule Dux.Backend do
 
     columns =
       Enum.map(col_names, fn col ->
-        Enum.map(Map.fetch!(map, col), &normalize_value/1)
+        maybe_normalize(Map.fetch!(map, col))
       end)
 
     Enum.zip_with(columns, fn values ->
       Enum.zip(col_names, values) |> Map.new()
     end)
   end
+
+  # Skip normalize_value for columns that don't contain Decimals.
+  # ADBC returns Decimal structs for DuckDB aggregation results (SUM, COUNT)
+  # and DECIMAL types, but most columns (integers, floats, strings) don't
+  # need normalization. Checking the first non-nil value avoids iterating
+  # 100K+ values through normalize_value/1 when it's a no-op.
+  defp maybe_normalize([]), do: []
+
+  defp maybe_normalize(values) do
+    if needs_normalize?(values) do
+      Enum.map(values, &normalize_value/1)
+    else
+      values
+    end
+  end
+
+  defp needs_normalize?([%Decimal{} | _]), do: true
+  defp needs_normalize?([nil | rest]), do: needs_normalize?(rest)
+  defp needs_normalize?(_), do: false
 
   # ---------------------------------------------------------------------------
   # Arrow IPC serialization (for distribution)
