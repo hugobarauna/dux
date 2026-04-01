@@ -3,7 +3,7 @@
 ```elixir
 Mix.install([
   {:dux, "~> 0.3.0"},
-  {:kino_dux, "~> 0.1"},
+  {:kino_dux, "~> 0.2"},
   {:flame, "~> 0.5"}
 ])
 ```

@@ -182,7 +182,7 @@ Add [`kino_dux`](https://github.com/elixir-dux/kino_dux) for rich rendering and 
 ```elixir
 Mix.install([
   {:dux, "~> 0.3.0"},
-  {:kino_dux, "~> 0.1"}
+  {:kino_dux, "~> 0.2"}
 ])
 ```
 
